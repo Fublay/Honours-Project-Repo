@@ -7,6 +7,9 @@ from datetime import datetime
 from skopt import gp_minimize
 from skopt.space import Real
 
+import laser_command_ids as CMD
+from serial_io import SerialLineIO
+
 # ---------------------------------------------------------------------------
 # Simple console logger
 # ---------------------------------------------------------------------------
@@ -28,57 +31,6 @@ DATA_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Robust serial line reader/writer
-# Keeps leftover bytes between calls so we never lose data.
-# This fixes the exact issue you hit (garbled/partial RX lines and timeouts).
-# ---------------------------------------------------------------------------
-class SerialLineIO:
-    def __init__(self, ser: serial.Serial, log_data_lines: bool = False, data_log_every: int = 50):
-        """
-        log_data_lines:
-            If True, will log some DATA lines too (can be very spammy).
-        data_log_every:
-            If log_data_lines True, only logs every Nth DATA line.
-        """
-        self.ser = ser
-        self.buf = b""
-        self.log_data_lines = log_data_lines
-        self.data_log_every = max(1, int(data_log_every))
-        self._data_seen = 0
-
-    def write_line(self, line: str) -> None:
-        log(f"TX → {line}")
-        self.ser.write((line.strip() + "\n").encode("ascii", errors="ignore"))
-
-    def read_line(self, timeout: float = 2.0) -> str:
-        t0 = time.time()
-
-        while time.time() - t0 < timeout:
-            # If we already have a full line buffered, return it.
-            if b"\n" in self.buf:
-                line_bytes, self.buf = self.buf.split(b"\n", 1)
-                line = line_bytes.decode("ascii", errors="ignore").strip()
-
-                # Logging policy: always log OK/ERR; optionally log some DATA
-                if line.startswith("DATA"):
-                    self._data_seen += 1
-                    if self.log_data_lines and (self._data_seen % self.data_log_every == 0):
-                        log(f"RX ← {line}")
-                else:
-                    log(f"RX ← {line}")
-
-                return line
-
-            # Otherwise, read more bytes from serial.
-            chunk = self.ser.read(256)
-            if chunk:
-                self.buf += chunk
-            else:
-                time.sleep(0.01)
-
-        raise TimeoutError("Timed out waiting for serial data")
-
-# ---------------------------------------------------------------------------
 # Run ONE closed-loop experiment
 # ---------------------------------------------------------------------------
 def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float = 0.8, duration: float = 8.0):
@@ -94,15 +46,15 @@ def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float
     kd = float(np.clip(kd, 0.0, 2.0))
 
     # Apply PID
-    io.write_line(f"SET PID {kp} {ki} {kd}")
+    io.write_command(f"SET PID {kp} {ki} {kd}", command_id_hex2=CMD.SET_PID)
     io.read_line(timeout=2.0)
 
     # Apply setpoint
-    io.write_line(f"SET SP {setpoint}")
+    io.write_command(f"SET SP {setpoint}", command_id_hex2=CMD.SET_SP)
     io.read_line(timeout=2.0)
 
     # Start trial
-    io.write_line(f"START {duration}")
+    io.write_command(f"START {duration}", command_id_hex2=CMD.START)
 
     t_vals, y_vals, u_vals, status_vals = [], [], [], []
 
@@ -201,16 +153,34 @@ def main():
     ap.add_argument("--iters", type=int, default=20, help="Number of optimisation iterations")
     ap.add_argument("--log-data", action="store_true", help="Log some DATA lines too (can be spammy)")
     ap.add_argument("--log-data-every", type=int, default=50, help="If --log-data, log every Nth DATA line")
+    ap.add_argument(
+        "--protocol",
+        choices=["legacy", "framed"],
+        default="legacy",
+        help="Serial protocol mode: legacy (newline-terminated ASCII) or framed ($XXYYYYCC\\r\\n)",
+    )
+    ap.add_argument(
+        "--default-cmd-id",
+        default="00",
+        help="Default 2-hex-digit command id (XX) used in framed mode when not specified per command",
+    )
     args = ap.parse_args()
 
     log("Opening serial port")
     ser = serial.Serial(args.port, args.baud, timeout=0.1)
 
     # Create robust line IO wrapper
-    io = SerialLineIO(ser, log_data_lines=args.log_data, data_log_every=args.log_data_every)
+    io = SerialLineIO(
+        ser,
+        log_fn=log,
+        log_data_lines=args.log_data,
+        data_log_every=args.log_data_every,
+        protocol_mode=args.protocol,
+        default_command_id_hex2=args.default_cmd_id,
+    )
 
     # Connectivity check
-    io.write_line("PING")
+    io.write_command("PING", command_id_hex2=CMD.PING)
     resp = io.read_line(timeout=2.0)
     if "PONG" not in resp:
         log("⚠ Warning: unexpected PING response, continuing anyway")
