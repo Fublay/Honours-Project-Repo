@@ -9,9 +9,7 @@ class SerialLineIO:
     Robust serial line reader/writer.
 
     - Keeps leftover bytes between calls so we never lose data.
-    - Supports protocol_mode:
-        - "legacy": send "COMMAND\\n" (existing simulator protocol)
-        - "framed": send "$XXYYYYCC\\r\\n" (laser protocol)
+    - Uses the framed laser protocol only: send "$XXYYYYCC\\r\\n"
     """
 
     def __init__(
@@ -21,7 +19,6 @@ class SerialLineIO:
         log_fn,
         log_data_lines: bool = False,
         data_log_every: int = 50,
-        protocol_mode: str = "legacy",
         default_command_id_hex2: str = "00",
         checksum_fn=default_checksum_hex_2,
     ):
@@ -31,32 +28,16 @@ class SerialLineIO:
         self.log_data_lines = log_data_lines
         self.data_log_every = max(1, int(data_log_every))
         self._data_seen = 0
-        self.protocol_mode = (protocol_mode or "legacy").strip().lower()
         self.default_command_id_hex2 = (default_command_id_hex2 or "00").strip().upper()
         self.checksum_fn = checksum_fn
 
-    def write_line(self, line: str) -> None:
-        self.log_fn(f"TX → {line}")
-        self.ser.write((line.strip() + "\n").encode("ascii", errors="ignore"))
-
     def write_command(self, data: str, *, command_id_hex2: str | None = None) -> None:
         """
-        Writes a logical command according to the selected protocol.
+        Writes a framed command: "$XXYYYYCC\\r\\n"
 
-        legacy:
-          - `data` is the full line, e.g. "PING" or "SET PID 1 2 3"
-
-        framed:
-          - `data` is YYYY payload (variable length)
-          - command id is XX (2 hex digits)
+        - `data` is the YYYY payload (variable length, ASCII)
+        - command id is XX (2 hex digits)
         """
-        if self.protocol_mode == "legacy":
-            self.write_line(data)
-            return
-
-        if self.protocol_mode != "framed":
-            raise ValueError(f"Unknown protocol_mode={self.protocol_mode!r}")
-
         cid = self.default_command_id_hex2 if command_id_hex2 is None else str(command_id_hex2).strip().upper()
         framed = compose_frame(cid, data, checksum_fn=self.checksum_fn)
         self.log_fn(f"TX → {framed!r}")

@@ -153,17 +153,6 @@ def main():
     ap.add_argument("--iters", type=int, default=20, help="Number of optimisation iterations")
     ap.add_argument("--log-data", action="store_true", help="Log some DATA lines too (can be spammy)")
     ap.add_argument("--log-data-every", type=int, default=50, help="If --log-data, log every Nth DATA line")
-    ap.add_argument(
-        "--protocol",
-        choices=["legacy", "framed"],
-        default="legacy",
-        help="Serial protocol mode: legacy (newline-terminated ASCII) or framed ($XXYYYYCC\\r\\n)",
-    )
-    ap.add_argument(
-        "--default-cmd-id",
-        default="00",
-        help="Default 2-hex-digit command id (XX) used in framed mode when not specified per command",
-    )
     args = ap.parse_args()
 
     log("Opening serial port")
@@ -175,12 +164,10 @@ def main():
         log_fn=log,
         log_data_lines=args.log_data,
         data_log_every=args.log_data_every,
-        protocol_mode=args.protocol,
-        default_command_id_hex2=args.default_cmd_id,
     )
 
     # Connectivity check
-    io.write_command("PING", command_id_hex2=CMD.PING)
+    io.write_command("123", command_id_hex2=CMD.PING)
     resp = io.read_line(timeout=2.0)
     if "PONG" not in resp:
         log("⚠ Warning: unexpected PING response, continuing anyway")
