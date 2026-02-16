@@ -1,11 +1,15 @@
 """
 Command ID registry for the laser serial protocol.
 
+Based on Power Feedback systems RS232 protocol.
 """
 
-# NOTE: These are placeholders. Replace with the real hex IDs.
+# PID control commands
+GET_PID = "B6"  # Read current PID values
+SET_PID = "B5"  # Write PID values
+
+# Legacy/placeholder commands (may need updating based on actual protocol)
 PING = "6A"
-SET_PID = "10"
 SET_SP = "11"
 START = "12"
 

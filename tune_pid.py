@@ -45,9 +45,28 @@ def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float
     ki = float(np.clip(ki, 0.0, 10.0))
     kd = float(np.clip(kd, 0.0, 2.0))
 
-    # Apply PID
-    io.write_command(f"SET PID {kp} {ki} {kd}", command_id_hex2=CMD.SET_PID)
-    io.read_line(timeout=2.0)
+    # Read current PID values to preserve PP parameters, holdoff, and sample_interval
+    try:
+        current_pid = io.get_pid_values(timeout=2.0)
+        log(f"Current PID values: PW Kp={current_pid['pw_kp']:.4f}, Ki={current_pid['pw_ki']:.4f}, Kd={current_pid['pw_kd']:.4f}")
+    except Exception as e:
+        log(f"⚠ Warning: Could not read current PID values: {e}. Using defaults for PP parameters.")
+        current_pid = None
+
+    # Apply PID (focusing on PW parameters, keeping PP parameters unchanged)
+    ack = io.set_pid_values(
+        pw_kp=kp,
+        pw_ki=ki,
+        pw_kd=kd,
+        current_values=current_pid,
+        timeout=2.0
+    )
+    
+    # Verify acknowledgment (format: *00\r\n)
+    if not ack.startswith("*"):
+        log(f"⚠ Warning: Unexpected SET_PID acknowledgment: {ack}")
+    elif "*00" not in ack:
+        log(f"⚠ Warning: SET_PID returned error code: {ack}")
 
     # Apply setpoint
     io.write_command(f"SET SP {setpoint}", command_id_hex2=CMD.SET_SP)

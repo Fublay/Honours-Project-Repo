@@ -1,7 +1,13 @@
 import time
 import serial
 
-from laser_protocol import compose_frame, default_checksum_hex_2
+from laser_protocol import (
+    compose_frame,
+    default_checksum_hex_2,
+    compose_set_pid_command,
+    parse_pid_reply,
+)
+import laser_command_ids as CMD
 
 
 class SerialLineIO:
@@ -68,4 +74,85 @@ class SerialLineIO:
                 time.sleep(0.01)
 
         raise TimeoutError("Timed out waiting for serial data")
+
+    def get_pid_values(self, timeout: float = 2.0) -> dict:
+        """
+        Read current PID values from the laser controller.
+        
+        Returns:
+            Dictionary with keys: pw_kp, pw_ki, pw_kd, pp_kp, pp_ki, pp_kd, holdoff, sample_interval
+        
+        Raises:
+            TimeoutError if no reply received
+            ValueError if reply format is invalid
+        """
+        # Send GET_PID command: $B600\r\n (no data, checksum is 00)
+        cmd_bytes = compose_frame("B6", "", checksum_fn=self.checksum_fn)
+        self.log_fn(f"TX → {cmd_bytes!r}")
+        self.ser.write(cmd_bytes)
+        
+        # Read reply
+        reply = self.read_line(timeout=timeout)
+        
+        # Parse PID values from reply
+        return parse_pid_reply(reply)
+
+    def set_pid_values(
+        self,
+        pw_kp: float,
+        pw_ki: float,
+        pw_kd: float,
+        pp_kp: float | None = None,
+        pp_ki: float | None = None,
+        pp_kd: float | None = None,
+        holdoff: float | None = None,
+        sample_interval: float | None = None,
+        current_values: dict | None = None,
+        timeout: float = 2.0,
+    ) -> str:
+        """
+        Set PID values on the laser controller.
+        
+        Args:
+            pw_kp, pw_ki, pw_kd: Pulse Width PID parameters (required)
+            pp_kp, pp_ki, pp_kd: Pulse Period PID parameters (optional)
+            holdoff: Holdoff period in ms (optional)
+            sample_interval: Sample interval in ms (optional)
+            current_values: Current PID values dict (used for unspecified parameters)
+            timeout: Timeout for reading acknowledgment
+        
+        Returns:
+            Acknowledgment string (e.g., "*00\r\n")
+        
+        Raises:
+            TimeoutError if no reply received
+        """
+        # If current_values not provided, read them first
+        if current_values is None:
+            try:
+                current_values = self.get_pid_values(timeout=timeout)
+            except Exception:
+                # If we can't read current values, use defaults
+                current_values = None
+        
+        # Compose SET_PID command
+        cmd_bytes = compose_set_pid_command(
+            pw_kp=pw_kp,
+            pw_ki=pw_ki,
+            pw_kd=pw_kd,
+            pp_kp=pp_kp,
+            pp_ki=pp_ki,
+            pp_kd=pp_kd,
+            holdoff=holdoff,
+            sample_interval=sample_interval,
+            current_values=current_values,
+            checksum_fn=self.checksum_fn,
+        )
+        
+        self.log_fn(f"TX → {cmd_bytes!r}")
+        self.ser.write(cmd_bytes)
+        
+        # Read acknowledgment (format: *00\r\n)
+        ack = self.read_line(timeout=timeout)
+        return ack
 
