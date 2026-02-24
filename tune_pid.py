@@ -1,140 +1,87 @@
-import time
-import re
 import csv
-import serial
-import numpy as np
 from datetime import datetime
+
+import numpy as np
+import serial
 from skopt import gp_minimize
 from skopt.space import Real
 
 import laser_command_ids as CMD
-from serial_io import SerialLineIO
+from pipeline.data_collector import collect_trial_data
+from protocol.reply_parser import parse_ack
+from transport.serial_interface import SerialLineIO
 
-# ---------------------------------------------------------------------------
-# Simple console logger
-# ---------------------------------------------------------------------------
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
-# ---------------------------------------------------------------------------
-# Regex used to parse telemetry lines sent by the laser simulator.
-# Example:
-#   DATA t=0.1200 y=0.734000 sp=0.800000 u=0.512000 status=OK
-# ---------------------------------------------------------------------------
-DATA_RE = re.compile(
-    r"t=([0-9.]+)\s+"
-    r"y=([0-9.eE+-]+)\s+"
-    r"sp=([0-9.eE+-]+)\s+"
-    r"u=([0-9.eE+-]+)\s+"
-    r"status=([A-Z]+)"
-)
 
-# ---------------------------------------------------------------------------
-# Run ONE closed-loop experiment
-# ---------------------------------------------------------------------------
 def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float = 0.8, duration: float = 8.0):
     """
     Runs one tuning trial and returns arrays (t, y, u) plus aborted flag.
     """
-
+    _ = duration
     log(f"Starting trial: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
 
-    # HARD SAFETY LIMITS for gains (controller-side clamp)
     kp = float(np.clip(kp, 0.0, 10.0))
     ki = float(np.clip(ki, 0.0, 10.0))
     kd = float(np.clip(kd, 0.0, 2.0))
 
-    # Read current PID values to preserve PP parameters, holdoff, and sample_interval
     try:
         current_pid = io.get_pid_values(timeout=2.0)
-        log(f"Current PID values: PW Kp={current_pid['pw_kp']:.4f}, Ki={current_pid['pw_ki']:.4f}, Kd={current_pid['pw_kd']:.4f}")
+        log(
+            "Current PID values: "
+            f"PW Kp={current_pid['pw_kp']:.4f}, "
+            f"Ki={current_pid['pw_ki']:.4f}, "
+            f"Kd={current_pid['pw_kd']:.4f}"
+        )
     except Exception as e:
-        log(f"⚠ Warning: Could not read current PID values: {e}. Using defaults for PP parameters.")
+        log(f"Warning: Could not read current PID values: {e}. Using defaults for PP parameters.")
         current_pid = None
 
-    # Apply PID (focusing on PW parameters, keeping PP parameters unchanged)
     ack = io.set_pid_values(
         pw_kp=kp,
         pw_ki=ki,
         pw_kd=kd,
         current_values=current_pid,
-        timeout=2.0
+        timeout=2.0,
     )
-    
-    # Verify acknowledgment (format: *00\r\n)
+    ok_ack, _ = parse_ack(ack)
     if not ack.startswith("*"):
-        log(f"⚠ Warning: Unexpected SET_PID acknowledgment: {ack}")
-    elif "*00" not in ack:
-        log(f"⚠ Warning: SET_PID returned error code: {ack}")
+        log(f"Warning: Unexpected SET_PID acknowledgment: {ack}")
+    elif not ok_ack:
+        log(f"Warning: SET_PID returned error code: {ack}")
 
-    # Apply setpoint
-    io.write_command(f"SET SP {setpoint}", command_id_hex2=CMD.SET_SP)
-    io.read_line(timeout=2.0)
+    io.write_command("", command_id_hex2=CMD.START)
 
-    # Start trial
-    io.write_command(f"START {duration}", command_id_hex2=CMD.START)
-
-    t_vals, y_vals, u_vals, status_vals = [], [], [], []
-
-    while True:
-        line = io.read_line(timeout=5.0)
-
-        if line.startswith("DATA"):
-            match = DATA_RE.search(line)
-            if not match:
-                # Ignore malformed telemetry lines
-                continue
-
-            t, y, sp, u, status = match.groups()
-            t_vals.append(float(t))
-            y_vals.append(float(y))
-            u_vals.append(float(u))
-            status_vals.append(status)
-
-        elif line.startswith("OK DONE"):
-            log("Trial finished")
-            break
-
-        elif line.startswith("ERR"):
-            raise RuntimeError(line)
-
-        # Any other lines are ignored (or already logged above)
+    t_vals, y_vals, u_vals, status_vals = collect_trial_data(
+        io,
+        line_timeout=5.0,
+        on_done=lambda: log("Trial finished"),
+    )
 
     aborted = any(s == "ABORT" for s in status_vals)
     if aborted:
-        log("⚠ Trial aborted due to safety condition")
+        log("Warning: Trial aborted due to safety condition")
 
     return np.array(t_vals), np.array(y_vals), np.array(u_vals), aborted
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
+
 def compute_metrics(t: np.ndarray, y: np.ndarray, setpoint: float, settle_band: float = 0.02):
-    """
-    Computes:
-      - overshoot (%)
-      - settling time (s)
-      - integral of absolute error (IAE)
-    """
     if len(t) < 5:
         return 999.0, 999.0, 999.0
 
     error = setpoint - y
-
-    # Integral of Absolute Error
     iae = float(np.trapezoid(np.abs(error), t))
 
-    # Overshoot
     peak = float(np.max(y))
     overshoot = 0.0
     if peak > setpoint and setpoint != 0:
         overshoot = 100.0 * (peak - setpoint) / abs(setpoint)
 
-    # Settling time: first time after which y stays within band
     band_low = setpoint * (1.0 - settle_band)
     band_high = setpoint * (1.0 + settle_band)
-
     settling_time = float(t[-1])
     for i in range(len(t)):
         if np.all((y[i:] >= band_low) & (y[i:] <= band_high)):
@@ -143,26 +90,17 @@ def compute_metrics(t: np.ndarray, y: np.ndarray, setpoint: float, settle_band: 
 
     return overshoot, settling_time, iae
 
-# ---------------------------------------------------------------------------
-# Objective scoring
-# ---------------------------------------------------------------------------
+
 def score_controller(overshoot: float, settling_time: float, iae: float, aborted: bool):
-    """
-    Combines metrics into one scalar score. Lower is better.
-    """
     score = 0.0
     score += 2.0 * overshoot
     score += 1.5 * settling_time
     score += 1.0 * iae
-
     if aborted:
         score += 500.0
-
     return float(score)
 
-# ---------------------------------------------------------------------------
-# Main optimisation routine
-# ---------------------------------------------------------------------------
+
 def main():
     import argparse
 
@@ -176,8 +114,6 @@ def main():
 
     log("Opening serial port")
     ser = serial.Serial(args.port, args.baud, timeout=0.1)
-
-    # Create robust line IO wrapper
     io = SerialLineIO(
         ser,
         log_fn=log,
@@ -185,42 +121,35 @@ def main():
         data_log_every=args.log_data_every,
     )
 
-    # Connectivity check
     io.write_command("123", command_id_hex2=CMD.PING)
     resp = io.read_line(timeout=2.0)
     if "PONG" not in resp:
-        log("⚠ Warning: unexpected PING response, continuing anyway")
+        log("Warning: unexpected PING response, continuing anyway")
 
     setpoint = 0.8
     duration = 15.0
-
-    # Search space for PID gains
     space = [
         Real(0.0, 6.0, name="kp"),
         Real(0.0, 6.0, name="ki"),
         Real(0.0, 1.0, name="kd"),
     ]
 
-    history = []  # (kp, ki, kd, score, overshoot, settling, iae, aborted)
+    history = []
 
     def objective(x):
         kp, ki, kd = x
-
         t, y, u, aborted = run_trial(io, kp, ki, kd, setpoint=setpoint, duration=duration)
-
         overshoot, settling, iae = compute_metrics(t, y, setpoint)
         score = score_controller(overshoot, settling, iae, aborted)
-
         history.append((kp, ki, kd, score, overshoot, settling, iae, int(aborted)))
-
         log(
-            f"Result → score={score:.2f}, "
+            f"Result -> score={score:.2f}, "
             f"overshoot={overshoot:.2f}%, "
             f"settling={settling:.3f}s, "
             f"IAE={iae:.3f}, "
             f"aborted={aborted}"
         )
-
+        _ = u
         return score
 
     log("Starting Bayesian Optimisation")
@@ -230,22 +159,20 @@ def main():
         n_calls=args.iters,
         n_initial_points=min(6, args.iters),
         acq_func="EI",
-        random_state=42
+        random_state=42,
     )
 
     best_kp, best_ki, best_kd = result.x
-
     log("Optimisation complete")
     log(f"BEST kp={best_kp:.6f}, ki={best_ki:.6f}, kd={best_kd:.6f}")
     log(f"Best score={result.fun:.3f}")
 
-    # Save results
     with open("tuning_history.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["kp", "ki", "kd", "score", "overshoot_pct", "settling_s", "iae", "aborted"])
         writer.writerows(history)
-
     log("Saved tuning_history.csv")
+
 
 if __name__ == "__main__":
     main()
