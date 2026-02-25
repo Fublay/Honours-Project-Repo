@@ -17,6 +17,22 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def prompt_launch_action() -> str:
+    """
+    Ask user whether to start tuning, test protocol command, or exit.
+    Returns "start", "test-protocol", or "quit".
+    """
+    while True:
+        choice = input("Choose action: [s]tart test, [t]est protocol, or [q]uit: ").strip().lower()
+        if choice in {"s", "start"}:
+            return "start"
+        if choice in {"t", "test", "protocol", "test protocol"}:
+            return "test-protocol"
+        if choice in {"q", "quit", "exit"}:
+            return "quit"
+        print("Please enter 's' to start, 't' to test protocol, or 'q' to quit.", flush=True)
+
+
 def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float = 0.8, duration: float = 8.0):
     """
     Runs one tuning trial and returns arrays (t, y, u) plus aborted flag.
@@ -53,7 +69,9 @@ def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float
     elif not ok_ack:
         log(f"Warning: SET_PID returned error code: {ack}")
 
-    io.write_command("", command_id_hex2=CMD.START)
+    io.write_command("", command_id_hex2=CMD.RUN)
+    io.write_command("1", command_id_hex2=CMD.SHUTTER_CONTROL)
+    io.write_command("", command_id_hex2=CMD.TRIGGER)
 
     t_vals, y_vals, u_vals, status_vals = collect_trial_data(
         io,
@@ -112,6 +130,11 @@ def main():
     ap.add_argument("--log-data-every", type=int, default=50, help="If --log-data, log every Nth DATA line")
     args = ap.parse_args()
 
+    action = prompt_launch_action()
+    if action == "quit":
+        log("Exiting on user request.")
+        return
+
     log("Opening serial port")
     ser = serial.Serial(args.port, args.baud, timeout=0.1)
     io = SerialLineIO(
@@ -121,10 +144,16 @@ def main():
         data_log_every=args.log_data_every,
     )
 
-    io.write_command("123", command_id_hex2=CMD.PING)
-    resp = io.read_line(timeout=2.0)
-    if "PONG" not in resp:
-        log("Warning: unexpected PING response, continuing anyway")
+    if action == "test-protocol":
+        log("Sending GET_FLOW test command")
+        io.write_command("", command_id_hex2=CMD.GET_FLOW)
+        try:
+            resp = io.read_line(timeout=2.0)
+            log(f"GET_FLOW response: {resp}")
+        except Exception as e:
+            log(f"No immediate GET_FLOW response: {e}")
+        log("Protocol test complete. Exiting.")
+        return
 
     setpoint = 0.8
     duration = 15.0

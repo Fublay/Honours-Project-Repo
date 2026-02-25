@@ -5,8 +5,8 @@ from protocol.frame_codec import is_framed_command
 
 DATA_RE = re.compile(
     r"t=([0-9.]+)\s+"
-    r"y=([0-9.eE+-]+)\s+"
-    r"sp=([0-9.eE+-]+)\s+"
+    r"y=([0-9.eE+-]+)"
+    r"(?:\s+sp=([0-9.eE+-]+))?\s+"
     r"u=([0-9.eE+-]+)\s+"
     r"status=([A-Z]+)"
 )
@@ -29,7 +29,9 @@ def parse_pid_reply(packet: str) -> dict:
         raise ValueError("Packet too short")
 
     received_checksum_str = pkt[-2:]
-    data_portion = pkt[3:-2].strip()
+    # Keep exact spacing from device reply for checksum calculation.
+    # Some controllers include leading spaces in checksum accumulation.
+    data_portion = pkt[3:-2]
     calculated_checksum = sum(ord(ch) for ch in data_portion) % 256
     received_checksum = int(received_checksum_str, 16)
     if calculated_checksum != received_checksum:
@@ -71,7 +73,8 @@ def parse_ack(line: str) -> tuple[bool, str]:
 def parse_telemetry_line(line: str) -> dict | None:
     """
     Parse one telemetry line:
-      DATA t=... y=... sp=... u=... status=...
+      DATA t=... y=... u=... status=...
+    Optionally accepts legacy 'sp=...' field.
     """
     s = (line or "").strip()
     if not s.startswith("DATA"):
@@ -81,11 +84,10 @@ def parse_telemetry_line(line: str) -> dict | None:
     if not match:
         return None
 
-    t, y, sp, u, status = match.groups()
+    t, y, _sp, u, status = match.groups()
     return {
         "t": float(t),
         "y": float(y),
-        "sp": float(sp),
         "u": float(u),
         "status": status,
     }

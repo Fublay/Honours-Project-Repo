@@ -6,7 +6,6 @@ def map_telemetry_values(raw: dict) -> dict:
     return {
         "time_s": float(raw["t"]),
         "process_value": float(raw["y"]),
-        "setpoint": float(raw["sp"]),
         "control_output": float(raw["u"]),
         "status": str(raw["status"]),
     }
