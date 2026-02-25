@@ -19,18 +19,16 @@ def log(msg: str) -> None:
 
 def prompt_launch_action() -> str:
     """
-    Ask user whether to start tuning, test protocol command, or exit.
-    Returns "start", "test-protocol", or "quit".
+    Ask user whether to start tuning or exit.
+    Returns "start" or "quit".
     """
     while True:
-        choice = input("Choose action: [s]tart test, [t]est protocol, or [q]uit: ").strip().lower()
+        choice = input("Choose action: [s]tart test or [q]uit: ").strip().lower()
         if choice in {"s", "start"}:
             return "start"
-        if choice in {"t", "test", "protocol", "test protocol"}:
-            return "test-protocol"
         if choice in {"q", "quit", "exit"}:
             return "quit"
-        print("Please enter 's' to start, 't' to test protocol, or 'q' to quit.", flush=True)
+        print("Please enter s or q.", flush=True)
 
 
 def run_trial(
@@ -38,6 +36,9 @@ def run_trial(
     kp: float,
     ki: float,
     kd: float,
+    apply_pid_update: bool = True,
+    repeats: int = 5,
+    test_duration_s: float = 7.0,
     duration: float = 8.0,
     kp_max: float = 1.0,
     ki_max: float = 1.0,
@@ -52,6 +53,12 @@ def run_trial(
     kp = float(np.clip(kp, 0.0, kp_max))
     ki = float(np.clip(ki, 0.0, ki_max))
     kd = float(np.clip(kd, 0.0, kd_max))
+
+    try:
+        io.write_command_expect_ok_ack("000B", command_id_hex2=CMD.SET_DEBUG, timeout=2.0)
+        log("SET_DEBUG acknowledged with *00")
+    except Exception as e:
+        raise RuntimeError(f"SET_DEBUG did not receive success ACK '*00': {e}") from e
 
     try:
         current_pid = io.get_pid_values(timeout=2.0)
@@ -73,35 +80,72 @@ def run_trial(
             sample_interval_s = raw_si / 1000.0 if raw_si > 1.0 else raw_si
             log(f"Using telemetry sample interval: {sample_interval_s:.6f}s")
 
-    # ack = io.set_pid_values(
-    #     pw_kp=kp,
-    #     pw_ki=ki,
-    #     pw_kd=kd,
-    #     current_values=current_pid,
-    #     timeout=2.0,
-    # )
-    # ok_ack, _ = parse_ack(ack)
-    # if not ack.startswith("*"):
-    #     log(f"Warning: Unexpected SET_PID acknowledgment: {ack}")
-    # elif not ok_ack:
-    #     log(f"Warning: SET_PID returned error code: {ack}")
+    if apply_pid_update:
+        ack = io.set_pid_values(
+            pw_kp=kp,
+            pw_ki=ki,
+            pw_kd=kd,
+            current_values=current_pid,
+            timeout=2.0,
+        )
+        ok_ack, _ = parse_ack(ack)
+        if not ack.startswith("*"):
+            log(f"Warning: Unexpected SET_PID acknowledgment: {ack}")
+        elif not ok_ack:
+            log(f"Warning: SET_PID returned error code: {ack}")
+    else:
+        log("First trial: using current laser PID values without override")
 
-    io.write_command("", command_id_hex2=CMD.RUN)
-    io.write_command("1", command_id_hex2=CMD.SHUTTER_CONTROL)
-    io.write_command("", command_id_hex2=CMD.TRIGGER)
+    t_vals, y_vals, u_vals, status_vals = [], [], [], []
+    io.write_command_expect_ok_ack("", command_id_hex2=CMD.RUN, timeout=2.0)
+    io.write_command_expect_ok_ack("1", command_id_hex2=CMD.SHUTTER_CONTROL, timeout=2.0)
 
-    t_vals, y_vals, u_vals, status_vals = collect_trial_data(
-        io,
-        line_timeout=5.0,
-        sample_interval_s=sample_interval_s,
-        on_done=lambda: log("Trial finished"),
-    )
+    try:
+        for rep in range(repeats):
+            log(f"Test {rep + 1}/{repeats}: START")
+            io.write_command_expect_ok_ack("", command_id_hex2=CMD.START, timeout=2.0)
+
+            rt, ry, ru, rs = collect_trial_data(
+                io,
+                line_timeout=0.5,
+                sample_interval_s=sample_interval_s,
+                duration_s=test_duration_s,
+                stop_on_done=False,
+            )
+            t_offset = rep * test_duration_s
+            t_vals.extend([float(v) + t_offset for v in rt])
+            y_vals.extend(ry)
+            u_vals.extend(ru)
+            status_vals.extend(rs)
+
+            if ry:
+                avg_power = float(np.mean(ry))
+                min_power = float(np.min(ry))
+                max_power = float(np.max(ry))
+                log(
+                    f"Test {rep + 1}/{repeats} current_power -> "
+                    f"avg={avg_power:.4f}, min={min_power:.4f}, max={max_power:.4f}, n={len(ry)}"
+                )
+            else:
+                log(f"Test {rep + 1}/{repeats} current_power -> no samples")
+
+            io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
+            log(f"Test {rep + 1}/{repeats}: STOP")
+    finally:
+        # End-of-set cleanup after the 5th test (or on error): stop, close shutter, standby.
+        try:
+            io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
+        except Exception:
+            pass
+        io.write_command_expect_ok_ack("0", command_id_hex2=CMD.SHUTTER_CONTROL, timeout=2.0)
+        io.write_command_expect_ok_ack("", command_id_hex2=CMD.STANDBY, timeout=2.0)
+        log("End of PID set: shutter closed, standby set")
 
     aborted = any(s == "ABORT" for s in status_vals)
     if aborted:
         log("Warning: Trial aborted due to safety condition")
 
-    return np.array(t_vals), np.array(y_vals), np.array(u_vals), aborted
+    return np.array(t_vals), np.array(y_vals), np.array(u_vals), aborted, current_pid
 
 
 def compute_metrics(y: np.ndarray, desired_output: float):
@@ -151,17 +195,6 @@ def main():
         data_log_every=args.log_data_every,
     )
 
-    if action == "test-protocol":
-        log("Sending GET_FLOW test command")
-        io.write_command("", command_id_hex2=CMD.GET_FLOW)
-        try:
-            resp = io.read_line(timeout=2.0)
-            log(f"GET_FLOW response: {resp}")
-        except Exception as e:
-            log(f"No immediate GET_FLOW response: {e}")
-        log("Protocol test complete. Exiting.")
-        return
-
     duration = 15.0
     space = [
         Real(0.0, args.kp_max, name="kp"),
@@ -170,22 +203,35 @@ def main():
     ]
 
     history = []
+    trial_index = 0
 
     def objective(x):
+        nonlocal trial_index
         kp, ki, kd = x
-        t, y, u, aborted = run_trial(
+        apply_pid_update = trial_index > 0
+        t, y, u, aborted, current_pid = run_trial(
             io,
             kp,
             ki,
             kd,
+            apply_pid_update=apply_pid_update,
             duration=duration,
             kp_max=args.kp_max,
             ki_max=args.ki_max,
             kd_max=args.kd_max,
         )
+        used_kp, used_ki, used_kd = kp, ki, kd
+        if trial_index == 0 and current_pid is not None:
+            used_kp = float(current_pid["pw_kp"])
+            used_ki = float(current_pid["pw_ki"])
+            used_kd = float(current_pid["pw_kd"])
+            log(
+                "Stored initial laser PID values for baseline trial: "
+                f"kp={used_kp:.4f}, ki={used_ki:.4f}, kd={used_kd:.4f}"
+            )
         mae, rmse, error_std = compute_metrics(y, args.desired_output)
         score = score_controller(mae, error_std, aborted)
-        history.append((kp, ki, kd, score, mae, rmse, error_std, int(aborted)))
+        history.append((used_kp, used_ki, used_kd, score, mae, rmse, error_std, int(aborted)))
         log(
             f"Result -> score={score:.2f}, "
             f"MAE={mae:.5f}, "
@@ -195,6 +241,7 @@ def main():
         )
         _ = u
         _ = t
+        trial_index += 1
         return score
 
     log("Starting Bayesian Optimisation")

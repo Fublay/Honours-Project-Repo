@@ -3,7 +3,7 @@ import serial
 
 from protocol.frame_codec import compose_frame, default_checksum_hex_2
 from protocol.command_composer import compose_set_pid_command
-from protocol.reply_parser import parse_pid_reply
+from protocol.reply_parser import parse_ack, parse_pid_reply
 
 
 class SerialLineIO:
@@ -71,8 +71,52 @@ class SerialLineIO:
         cmd_bytes = compose_frame("B6", "", checksum_fn=self.checksum_fn)
         self.log_fn(f"TX -> {cmd_bytes!r}")
         self.ser.write(cmd_bytes)
-        reply = self.read_line(timeout=timeout, keep_terminator=True)
-        return parse_pid_reply(reply)
+        deadline = time.time() + timeout
+        last_error = None
+
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            reply = self.read_line(timeout=remaining, keep_terminator=True)
+            try:
+                return parse_pid_reply(reply)
+            except Exception as e:
+                last_error = e
+                # Ignore unrelated frames/lines (e.g. debug stream) while waiting for $B6 reply.
+                continue
+
+        if last_error is not None:
+            raise ValueError(f"Failed to parse GET_PID reply before timeout: {last_error}")
+        raise TimeoutError("Timed out waiting for GET_PID reply")
+
+    def write_command_expect_ok_ack(
+        self,
+        data: str,
+        *,
+        command_id_hex2: str | None = None,
+        timeout: float = 2.0,
+    ) -> str:
+        """
+        Send command and wait for success ACK '*00'.
+        Ignores non-ACK lines (e.g. telemetry/debug) until timeout.
+        """
+        self.write_command(data, command_id_hex2=command_id_hex2)
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            line = self.read_line(timeout=remaining)
+            ok_ack, _ = parse_ack(line)
+            if not line.startswith("*"):
+                continue
+            if ok_ack:
+                return line
+            raise RuntimeError(f"Command failed with ACK: {line}")
+
+        raise TimeoutError("Timed out waiting for success ACK '*00'")
 
     def set_pid_values(
         self,

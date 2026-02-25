@@ -11,6 +11,11 @@ DATA_RE = re.compile(
     r"status=([A-Z]+)"
 )
 KV_RE = re.compile(r"([A-Za-z_]+)=([0-9.eE+-]+)")
+DEBUG_B0_RE = re.compile(
+    r"^\$B0"
+    r"([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8})"
+    r"([0-9A-Fa-f]{2})$"
+)
 
 
 def parse_pid_reply(packet: str) -> dict:
@@ -73,13 +78,32 @@ def parse_ack(line: str) -> tuple[bool, str]:
 
 def parse_telemetry_line(line: str) -> dict | None:
     """
-    Parse one telemetry line:
-      DATA t=... y=... u=... status=...
-    Optionally accepts legacy 'sp=...' field.
+    Parse one telemetry line from any supported format:
+      1) DATA t=... y=... u=... status=...
+      2) key/value packet with power/period/width fields
+      3) framed debug packet:
+         $B0AAAAAAAA:BBBBBBBB:CCCCCCCC:DDDDDDDDXX
     """
     s = (line or "").strip()
     if not s:
         return None
+
+    debug_match = DEBUG_B0_RE.match(s)
+    if debug_match is not None:
+        a_hex, b_hex, c_hex, d_hex, rx_checksum_hex = debug_match.groups()
+        payload = s[3:-2]  # exact bytes after command id, before checksum
+        calc_checksum = sum(ord(ch) for ch in payload) % 256
+        rx_checksum = int(rx_checksum_hex, 16)
+        if calc_checksum != rx_checksum:
+            return None
+        return {
+            "t": None,
+            "initial_power": float(int(a_hex, 16)),
+            "current_power": float(int(b_hex, 16)),
+            "pulse_width": float(int(c_hex, 16)),
+            "pulse_period": float(int(d_hex, 16)),
+            "status": "RUNNING",
+        }
 
     match = DATA_RE.search(s) if s.startswith("DATA") else None
     if match is not None:

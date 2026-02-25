@@ -30,7 +30,7 @@ def compose_frame(command_id_hex2: str, data: str, checksum_fn=default_checksum_
     if not re.fullmatch(r"[0-9A-F]{2}", cid):
         raise ValueError(f"command_id_hex2 must be exactly 2 hex digits, got {command_id_hex2!r}")
 
-    payload = (data or "").strip()
+    payload = data or ""
     if payload.startswith("$"):
         payload = payload[1:]
     payload = payload.replace("\r", "").replace("\n", "")

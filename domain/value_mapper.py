@@ -5,15 +5,15 @@ def map_telemetry_values(raw: dict) -> dict:
     Legacy DATA mode:
       uses y/u directly.
 
-    Power packet mode:
-      derives process_value from power * duty cycle, where
-      duty_cycle = pulse_width / pulse_period.
+    Power packet mode (B0 debug):
+      uses current_power directly as process_value so tuning/logging tracks
+      the power being reported by the laser.
     """
     if "initial_power" in raw and "current_power" in raw:
         pulse_period = float(raw["pulse_period"])
         pulse_width = float(raw["pulse_width"])
         duty_cycle = (pulse_width / pulse_period) if pulse_period > 0 else 0.0
-        process_value = float(raw["current_power"]) * duty_cycle
+        process_value = float(raw["current_power"])
         return {
             "time_s": float(raw["t"]) if raw.get("t") is not None else None,
             "process_value": process_value,

@@ -55,5 +55,6 @@ def compose_set_pid_command(
         format_pid_value(holdoff),
         format_pid_value(sample_interval),
     ]
-    data = " ".join(data_parts)
+    # Fixed-width protocol payload: 8 chars per field, left padded with spaces.
+    data = "".join(data_parts)
     return compose_frame("B5", data, checksum_fn=checksum_fn)
