@@ -33,16 +33,25 @@ def prompt_launch_action() -> str:
         print("Please enter 's' to start, 't' to test protocol, or 'q' to quit.", flush=True)
 
 
-def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float = 0.8, duration: float = 8.0):
+def run_trial(
+    io: SerialLineIO,
+    kp: float,
+    ki: float,
+    kd: float,
+    duration: float = 8.0,
+    kp_max: float = 1.0,
+    ki_max: float = 1.0,
+    kd_max: float = 0.2,
+):
     """
     Runs one tuning trial and returns arrays (t, y, u) plus aborted flag.
     """
     _ = duration
     log(f"Starting trial: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
 
-    kp = float(np.clip(kp, 0.0, 10.0))
-    ki = float(np.clip(ki, 0.0, 10.0))
-    kd = float(np.clip(kd, 0.0, 2.0))
+    kp = float(np.clip(kp, 0.0, kp_max))
+    ki = float(np.clip(ki, 0.0, ki_max))
+    kd = float(np.clip(kd, 0.0, kd_max))
 
     try:
         current_pid = io.get_pid_values(timeout=2.0)
@@ -56,18 +65,26 @@ def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float
         log(f"Warning: Could not read current PID values: {e}. Using defaults for PP parameters.")
         current_pid = None
 
-    ack = io.set_pid_values(
-        pw_kp=kp,
-        pw_ki=ki,
-        pw_kd=kd,
-        current_values=current_pid,
-        timeout=2.0,
-    )
-    ok_ack, _ = parse_ack(ack)
-    if not ack.startswith("*"):
-        log(f"Warning: Unexpected SET_PID acknowledgment: {ack}")
-    elif not ok_ack:
-        log(f"Warning: SET_PID returned error code: {ack}")
+    sample_interval_s = None
+    if current_pid is not None:
+        raw_si = float(current_pid.get("sample_interval", 0.0))
+        if raw_si > 0:
+            # Common firmware behavior: values > 1 are in milliseconds.
+            sample_interval_s = raw_si / 1000.0 if raw_si > 1.0 else raw_si
+            log(f"Using telemetry sample interval: {sample_interval_s:.6f}s")
+
+    # ack = io.set_pid_values(
+    #     pw_kp=kp,
+    #     pw_ki=ki,
+    #     pw_kd=kd,
+    #     current_values=current_pid,
+    #     timeout=2.0,
+    # )
+    # ok_ack, _ = parse_ack(ack)
+    # if not ack.startswith("*"):
+    #     log(f"Warning: Unexpected SET_PID acknowledgment: {ack}")
+    # elif not ok_ack:
+    #     log(f"Warning: SET_PID returned error code: {ack}")
 
     io.write_command("", command_id_hex2=CMD.RUN)
     io.write_command("1", command_id_hex2=CMD.SHUTTER_CONTROL)
@@ -76,6 +93,7 @@ def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float
     t_vals, y_vals, u_vals, status_vals = collect_trial_data(
         io,
         line_timeout=5.0,
+        sample_interval_s=sample_interval_s,
         on_done=lambda: log("Trial finished"),
     )
 
@@ -86,34 +104,19 @@ def run_trial(io: SerialLineIO, kp: float, ki: float, kd: float, setpoint: float
     return np.array(t_vals), np.array(y_vals), np.array(u_vals), aborted
 
 
-def compute_metrics(t: np.ndarray, y: np.ndarray, setpoint: float, settle_band: float = 0.02):
-    if len(t) < 5:
+def compute_metrics(y: np.ndarray, desired_output: float):
+    if len(y) < 5:
         return 999.0, 999.0, 999.0
 
-    error = setpoint - y
-    iae = float(np.trapezoid(np.abs(error), t))
-
-    peak = float(np.max(y))
-    overshoot = 0.0
-    if peak > setpoint and setpoint != 0:
-        overshoot = 100.0 * (peak - setpoint) / abs(setpoint)
-
-    band_low = setpoint * (1.0 - settle_band)
-    band_high = setpoint * (1.0 + settle_band)
-    settling_time = float(t[-1])
-    for i in range(len(t)):
-        if np.all((y[i:] >= band_low) & (y[i:] <= band_high)):
-            settling_time = float(t[i])
-            break
-
-    return overshoot, settling_time, iae
+    error = y - desired_output
+    mae = float(np.mean(np.abs(error)))
+    rmse = float(np.sqrt(np.mean(error**2)))
+    error_std = float(np.std(error))
+    return mae, rmse, error_std
 
 
-def score_controller(overshoot: float, settling_time: float, iae: float, aborted: bool):
-    score = 0.0
-    score += 2.0 * overshoot
-    score += 1.5 * settling_time
-    score += 1.0 * iae
+def score_controller(mae: float, error_std: float, aborted: bool):
+    score = mae + error_std
     if aborted:
         score += 500.0
     return float(score)
@@ -128,6 +131,10 @@ def main():
     ap.add_argument("--iters", type=int, default=20, help="Number of optimisation iterations")
     ap.add_argument("--log-data", action="store_true", help="Log some DATA lines too (can be spammy)")
     ap.add_argument("--log-data-every", type=int, default=50, help="If --log-data, log every Nth DATA line")
+    ap.add_argument("--kp-max", type=float, default=1.0, help="Upper limit for Kp search/clamp")
+    ap.add_argument("--ki-max", type=float, default=1.0, help="Upper limit for Ki search/clamp")
+    ap.add_argument("--kd-max", type=float, default=0.2, help="Upper limit for Kd search/clamp")
+    ap.add_argument("--desired-output", type=float, default=0.8, help="Target output value for scoring")
     args = ap.parse_args()
 
     action = prompt_launch_action()
@@ -155,30 +162,39 @@ def main():
         log("Protocol test complete. Exiting.")
         return
 
-    setpoint = 0.8
     duration = 15.0
     space = [
-        Real(0.0, 6.0, name="kp"),
-        Real(0.0, 6.0, name="ki"),
-        Real(0.0, 1.0, name="kd"),
+        Real(0.0, args.kp_max, name="kp"),
+        Real(0.0, args.ki_max, name="ki"),
+        Real(0.0, args.kd_max, name="kd"),
     ]
 
     history = []
 
     def objective(x):
         kp, ki, kd = x
-        t, y, u, aborted = run_trial(io, kp, ki, kd, setpoint=setpoint, duration=duration)
-        overshoot, settling, iae = compute_metrics(t, y, setpoint)
-        score = score_controller(overshoot, settling, iae, aborted)
-        history.append((kp, ki, kd, score, overshoot, settling, iae, int(aborted)))
+        t, y, u, aborted = run_trial(
+            io,
+            kp,
+            ki,
+            kd,
+            duration=duration,
+            kp_max=args.kp_max,
+            ki_max=args.ki_max,
+            kd_max=args.kd_max,
+        )
+        mae, rmse, error_std = compute_metrics(y, args.desired_output)
+        score = score_controller(mae, error_std, aborted)
+        history.append((kp, ki, kd, score, mae, rmse, error_std, int(aborted)))
         log(
             f"Result -> score={score:.2f}, "
-            f"overshoot={overshoot:.2f}%, "
-            f"settling={settling:.3f}s, "
-            f"IAE={iae:.3f}, "
+            f"MAE={mae:.5f}, "
+            f"RMSE={rmse:.5f}, "
+            f"err_std={error_std:.5f}, "
             f"aborted={aborted}"
         )
         _ = u
+        _ = t
         return score
 
     log("Starting Bayesian Optimisation")
@@ -198,7 +214,7 @@ def main():
 
     with open("tuning_history.csv", "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["kp", "ki", "kd", "score", "overshoot_pct", "settling_s", "iae", "aborted"])
+        writer.writerow(["kp", "ki", "kd", "score", "mae", "rmse", "error_std", "aborted"])
         writer.writerows(history)
     log("Saved tuning_history.csv")
 

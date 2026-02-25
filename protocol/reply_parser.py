@@ -10,6 +10,7 @@ DATA_RE = re.compile(
     r"u=([0-9.eE+-]+)\s+"
     r"status=([A-Z]+)"
 )
+KV_RE = re.compile(r"([A-Za-z_]+)=([0-9.eE+-]+)")
 
 
 def parse_pid_reply(packet: str) -> dict:
@@ -77,17 +78,43 @@ def parse_telemetry_line(line: str) -> dict | None:
     Optionally accepts legacy 'sp=...' field.
     """
     s = (line or "").strip()
-    if not s.startswith("DATA"):
+    if not s:
         return None
 
-    match = DATA_RE.search(s)
-    if not match:
+    match = DATA_RE.search(s) if s.startswith("DATA") else None
+    if match is not None:
+        t, y, _sp, u, status = match.groups()
+        return {
+            "t": float(t),
+            "y": float(y),
+            "u": float(u),
+            "status": status,
+        }
+
+    # New packet style: key/value fields that include initial/current power
+    # plus pulse period/width.
+    kv = {k.strip().lower(): float(v) for k, v in KV_RE.findall(s)}
+
+    def first(keys: tuple[str, ...]) -> float | None:
+        for key in keys:
+            if key in kv:
+                return kv[key]
         return None
 
-    t, y, _sp, u, status = match.groups()
+    initial_power = first(("initial_power", "initial", "init_power", "ip", "p0"))
+    current_power = first(("current_power", "current", "cur_power", "cp", "p"))
+    pulse_period = first(("pulse_period", "period", "pp"))
+    pulse_width = first(("pulse_width", "width", "pw"))
+    t_val = first(("t", "time", "time_s"))
+
+    if None in (initial_power, current_power, pulse_period, pulse_width):
+        return None
+
     return {
-        "t": float(t),
-        "y": float(y),
-        "u": float(u),
-        "status": status,
+        "t": t_val,
+        "initial_power": float(initial_power),
+        "current_power": float(current_power),
+        "pulse_period": float(pulse_period),
+        "pulse_width": float(pulse_width),
+        "status": "RUNNING",
     }
