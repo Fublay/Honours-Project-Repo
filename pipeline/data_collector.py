@@ -11,6 +11,7 @@ def collect_trial_data(
     sample_interval_s: float | None = None,
     duration_s: float | None = None,
     stop_on_done: bool = True,
+    on_sample=None,
     on_done=None,
 ):
     """
@@ -56,6 +57,11 @@ def collect_trial_data(
             u_vals.append(mapped["control_output"])
             status_vals.append(mapped["status"])
             sample_idx += 1
+
+            if on_sample is not None:
+                stop_now = bool(on_sample(t_val, mapped))
+                if stop_now:
+                    break
             continue
 
         if line_s.startswith("OK DONE"):

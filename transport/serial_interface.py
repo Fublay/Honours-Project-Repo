@@ -96,9 +96,10 @@ class SerialLineIO:
         *,
         command_id_hex2: str | None = None,
         timeout: float = 2.0,
+        accepted_codes: tuple[str, ...] = ("00",),
     ) -> str:
         """
-        Send command and wait for success ACK '*00'.
+        Send command and wait for an accepted ACK code.
         Ignores non-ACK lines (e.g. telemetry/debug) until timeout.
         """
         self.write_command(data, command_id_hex2=command_id_hex2)
@@ -109,14 +110,15 @@ class SerialLineIO:
             if remaining <= 0:
                 break
             line = self.read_line(timeout=remaining)
-            ok_ack, _ = parse_ack(line)
+            _, code = parse_ack(line)
             if not line.startswith("*"):
                 continue
-            if ok_ack:
+            if code in accepted_codes:
                 return line
             raise RuntimeError(f"Command failed with ACK: {line}")
 
-        raise TimeoutError("Timed out waiting for success ACK '*00'")
+        accepted = ", ".join(f"*{c}" for c in accepted_codes)
+        raise TimeoutError(f"Timed out waiting for accepted ACK ({accepted})")
 
     def set_pid_values(
         self,
