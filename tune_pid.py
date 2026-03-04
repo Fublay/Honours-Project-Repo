@@ -25,14 +25,16 @@ def log(msg: str) -> None:
 # Show a minimal startup menu and return the selected action.
 def prompt_launch_action() -> str:
     while True:
-        choice = input("Choose action: [s]tart test, [r]eset defaults, or [q]uit: ").strip().lower()
+        choice = input("Choose action: [s]tart test, [r]eset defaults, [g]raph power, or [q]uit: ").strip().lower()
         if choice in {"s", "start"}:
             return "start"
         if choice in {"r", "reset", "defaults", "reset defaults"}:
             return "reset"
+        if choice in {"g", "graph", "plot"}:
+            return "graph"
         if choice in {"q", "quit", "exit"}:
             return "quit"
-        print("Please enter s, r, or q.", flush=True)
+        print("Please enter s, r, g, or q.", flush=True)
 
 
 # Ask for the target power value used to score each PID candidate.
@@ -61,6 +63,303 @@ def prompt_trial_count(default_value: int) -> int:
             return value
         except ValueError:
             print("Please enter an integer value.", flush=True)
+
+
+def prompt_launch_gui(default_goal: float, default_trials: int, default_test_duration_s: float):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception:
+        return None
+
+    result = {
+        "action": None,
+        "goal": float(default_goal),
+        "trials": int(default_trials),
+        "test_duration_s": float(default_test_duration_s),
+    }
+
+    try:
+        root = tk.Tk()
+    except Exception:
+        return None
+
+    root.title("PID Tuner")
+    root.resizable(False, False)
+
+    frame = tk.Frame(root, padx=12, pady=12)
+    frame.grid(row=0, column=0, sticky="nsew")
+
+    tk.Label(frame, text="Goal Power Output").grid(row=0, column=0, sticky="w")
+    goal_var = tk.StringVar(value=f"{float(default_goal):.4f}")
+    goal_entry = tk.Entry(frame, textvariable=goal_var, width=16)
+    goal_entry.grid(row=1, column=0, sticky="w", pady=(2, 8))
+
+    tk.Label(frame, text="Number of Trials").grid(row=2, column=0, sticky="w")
+    trials_var = tk.StringVar(value=str(int(default_trials)))
+    trials_entry = tk.Entry(frame, textvariable=trials_var, width=16)
+    trials_entry.grid(row=3, column=0, sticky="w", pady=(2, 10))
+
+    tk.Label(frame, text="Test Duration (s)").grid(row=4, column=0, sticky="w")
+    duration_var = tk.StringVar(value=f"{float(default_test_duration_s):.1f}")
+    duration_entry = tk.Entry(frame, textvariable=duration_var, width=16)
+    duration_entry.grid(row=5, column=0, sticky="w", pady=(2, 10))
+
+    def parse_fields() -> bool:
+        try:
+            goal = float(goal_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Goal power output must be numeric.")
+            return False
+        try:
+            trials = int(trials_var.get().strip())
+            if trials < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Number of trials must be an integer >= 1.")
+            return False
+        try:
+            test_duration_s = float(duration_var.get().strip())
+            if test_duration_s <= 0.0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Test duration must be a number > 0.")
+            return False
+        result["goal"] = goal
+        result["trials"] = trials
+        result["test_duration_s"] = test_duration_s
+        return True
+
+    def on_start():
+        if not parse_fields():
+            return
+        result["action"] = "start"
+        root.destroy()
+
+    def on_reset():
+        result["action"] = "reset"
+        root.destroy()
+
+    def on_quit():
+        result["action"] = "quit"
+        root.destroy()
+
+    def on_graph():
+        result["action"] = "graph"
+        root.destroy()
+
+    btn_row = tk.Frame(frame)
+    btn_row.grid(row=6, column=0, sticky="w")
+    tk.Button(btn_row, text="Start Test", width=12, command=on_start).grid(row=0, column=0, padx=(0, 6))
+    tk.Button(btn_row, text="Reset Defaults", width=12, command=on_reset).grid(row=0, column=1, padx=(0, 6))
+    tk.Button(btn_row, text="Graph Power", width=11, command=on_graph).grid(row=0, column=2, padx=(0, 6))
+    tk.Button(btn_row, text="Quit", width=8, command=on_quit).grid(row=0, column=3)
+
+    root.protocol("WM_DELETE_WINDOW", on_quit)
+    goal_entry.focus_set()
+    root.mainloop()
+
+    if result["action"] is None:
+        result["action"] = "quit"
+    return result
+
+
+def load_power_series(csv_path: str):
+    series_map = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                trial = int(row["trial_index"])
+                test = int(row["test_index"])
+                t_s = float(row["time_s"])
+                power = float(row["current_power"])
+                goal = float(row["desired_output"])
+            except (ValueError, KeyError):
+                continue
+            key = (trial, test)
+            bucket = series_map.setdefault(key, {"time_s": [], "power": [], "goal": goal})
+            bucket["time_s"].append(t_s)
+            bucket["power"].append(power)
+            bucket["goal"] = goal
+
+    final = {}
+    for key, payload in series_map.items():
+        final[key] = {
+            "time_s": np.array(payload["time_s"], dtype=float),
+            "power": np.array(payload["power"], dtype=float),
+            "goal": float(payload["goal"]),
+        }
+    return final
+
+
+def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tuple[int, int] | None = None):
+    import matplotlib.pyplot as plt
+
+    series = load_power_series(csv_path)
+    if first_key not in series:
+        raise RuntimeError(f"Test not found: trial={first_key[0]}, test={first_key[1]}")
+    if second_key is not None and second_key not in series:
+        raise RuntimeError(f"Test not found: trial={second_key[0]}, test={second_key[1]}")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    first = series[first_key]
+    ax.plot(first["time_s"], first["power"], label=f"Trial {first_key[0]} Test {first_key[1]}")
+    ax.axhline(first["goal"], linestyle="--", linewidth=1.2, alpha=525.0, label=f"Goal {first['goal']:.2f}")
+
+    if second_key is not None:
+        second = series[second_key]
+        ax.plot(second["time_s"], second["power"], label=f"Trial {second_key[0]} Test {second_key[1]}")
+        if abs(second["goal"] - first["goal"]) > 1e-9:
+            ax.axhline(
+                second["goal"],
+                linestyle=":",
+                linewidth=1.2,
+                alpha=525.0,
+                label=f"Goal 2 {second['goal']:.2f}",
+            )
+
+    ax.set_title("Power Readings")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Current Power")
+    ax.set_ylim(bottom=0.0)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_power_tests_interactive(csv_path: str):
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Button, CheckButtons
+
+    series = load_power_series(csv_path)
+    if not series:
+        raise RuntimeError(f"No valid readings found in {csv_path}")
+
+    keys = sorted(series.keys())
+
+    fig = plt.figure(figsize=(12, 6))
+    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.4, 4.6])
+    ax_checks = fig.add_subplot(gs[0, 0])
+    ax_plot = fig.add_subplot(gs[0, 1])
+
+    lines_by_label = {}
+    labels = []
+    goals_plotted = set()
+    for key in keys:
+        trial, test = key
+        label = f"T{trial}-Test{test}"
+        payload = series[key]
+        line, = ax_plot.plot(payload["time_s"], payload["power"], label=label, visible=False)
+        lines_by_label[label] = line
+        labels.append(label)
+        goal_val = float(payload["goal"])
+        if goal_val not in goals_plotted:
+            ax_plot.axhline(goal_val, linestyle="--", linewidth=1.0, alpha=0.5, label=f"Goal {goal_val:.2f}")
+            goals_plotted.add(goal_val)
+
+    check = CheckButtons(ax_checks, labels, [False] * len(labels))
+
+    def visible_lines():
+        return [line for line in lines_by_label.values() if line.get_visible()]
+
+    def apply_default_view():
+        # Keep the baseline display behavior with a zero-based Y axis.
+        ax_plot.relim()
+        ax_plot.autoscale_view(scalex=True, scaley=True)
+        y_top = ax_plot.get_ylim()[1]
+        if not np.isfinite(y_top) or y_top <= 0.0:
+            y_top = 1.0
+        ax_plot.set_ylim(bottom=0.0, top=y_top)
+
+    def apply_zoomed_view():
+        # Zoom around currently visible traces; if none are visible, use all traces.
+        candidates = visible_lines()
+        if not candidates:
+            candidates = list(lines_by_label.values())
+        if not candidates:
+            return
+
+        ymins = []
+        ymaxs = []
+        for line in candidates:
+            y = np.asarray(line.get_ydata(), dtype=float)
+            if y.size == 0:
+                continue
+            ymins.append(float(np.min(y)))
+            ymaxs.append(float(np.max(y)))
+        if not ymins:
+            return
+
+        y_min = min(ymins)
+        y_max = max(ymaxs)
+        span = max(y_max - y_min, 1e-6)
+        pad = max(0.5, span * 0.08)
+        ax_plot.set_ylim(y_min - pad, y_max + pad)
+
+    def on_clicked(label):
+        line = lines_by_label[label]
+        line.set_visible(not line.get_visible())
+        ax_plot.legend(loc="best")
+        fig.canvas.draw_idle()
+
+    check.on_clicked(on_clicked)
+
+    # Add quick controls to toggle all traces at once.
+    ax_all_on = fig.add_axes([0.08, 0.08, 0.10, 0.06])
+    ax_all_off = fig.add_axes([0.19, 0.08, 0.10, 0.06])
+    ax_default_view = fig.add_axes([0.30, 0.08, 0.12, 0.06])
+    ax_zoom_view = fig.add_axes([0.43, 0.08, 0.12, 0.06])
+    btn_all_on = Button(ax_all_on, "All On")
+    btn_all_off = Button(ax_all_off, "All Off")
+    btn_default_view = Button(ax_default_view, "Default View")
+    btn_zoom_view = Button(ax_zoom_view, "Zoomed View")
+
+    def set_all(target_visible: bool):
+        statuses = list(check.get_status())
+        for idx, is_on in enumerate(statuses):
+            if bool(is_on) != bool(target_visible):
+                check.set_active(idx)
+        ax_plot.legend(loc="best")
+        fig.canvas.draw_idle()
+
+    btn_all_on.on_clicked(lambda _evt: set_all(True))
+    btn_all_off.on_clicked(lambda _evt: set_all(False))
+    btn_default_view.on_clicked(lambda _evt: (apply_default_view(), fig.canvas.draw_idle()))
+    btn_zoom_view.on_clicked(lambda _evt: (apply_zoomed_view(), fig.canvas.draw_idle()))
+
+    ax_checks.set_title("Select Tests")
+    ax_plot.set_title("Power Readings")
+    ax_plot.set_xlabel("Time (s)")
+    ax_plot.set_ylabel("Current Power")
+    apply_default_view()
+    ax_plot.grid(True, alpha=0.25)
+    ax_plot.legend(loc="best")
+    fig.tight_layout()
+    plt.show()
+
+
+def run_graph_tool(csv_path: str, prefer_gui: bool = True):
+    try:
+        series = load_power_series(csv_path)
+    except FileNotFoundError:
+        raise RuntimeError(f"Power readings file not found: {csv_path}")
+
+    if not series:
+        raise RuntimeError(f"No valid readings found in {csv_path}")
+
+    _ = series
+    _ = prefer_gui
+    try:
+        plot_power_tests_interactive(csv_path)
+    except ModuleNotFoundError as e:
+        if e.name == "matplotlib":
+            raise RuntimeError(
+                "Graphing requires matplotlib in your active environment. "
+                "Install with: pip install matplotlib"
+            ) from e
+        raise
 
 
 def reset_pid_defaults(io: SerialLineIO) -> None:
@@ -92,7 +391,7 @@ def run_trial(
     desired_output: float,
     apply_pid_update: bool = True,
     repeats: int = 5,
-    test_duration_s: float = 7.0,
+    test_duration_s: float = 12.0,
     startup_grace_s: float = 2.0,
     settled_window_samples: int = 5,
     duration: float = 8.0,
@@ -450,7 +749,7 @@ def main():
     ap.add_argument("--kp-max", type=float, default=1.0, help="Upper limit for Kp search/clamp")
     ap.add_argument("--ki-max", type=float, default=1.0, help="Upper limit for Ki search/clamp")
     ap.add_argument("--kd-max", type=float, default=0.2, help="Upper limit for Kd search/clamp")
-    ap.add_argument("--desired-output", type=float, default=0.8, help="Target output value for scoring")
+    ap.add_argument("--desired-output", type=float, default=525.0, help="Target output value for scoring")
     ap.add_argument("--w-start", type=float, default=1.0, help="Weight: start power error")
     ap.add_argument("--w-track", type=float, default=3.5, help="Weight: average tracking error")
     ap.add_argument("--w-dev", type=float, default=2.5, help="Weight: within-test deviation")
@@ -488,17 +787,41 @@ def main():
     ap.add_argument("--refine-radius-kp", type=float, default=0.2, help="Refinement radius around best Kp")
     ap.add_argument("--refine-radius-ki", type=float, default=0.2, help="Refinement radius around best Ki")
     ap.add_argument("--refine-radius-kd", type=float, default=0.05, help="Refinement radius around best Kd")
+    ap.add_argument("--no-gui", action="store_true", help="Disable launch GUI and use console prompts")
+    ap.add_argument("--power-csv", default="tuning_power_readings.csv", help="CSV file for graphing power readings")
+    ap.add_argument("--test-duration-s", type=float, default=12.0, help="Seconds per individual laser test")
     args = ap.parse_args()
 
-    action = prompt_launch_action()
+    action = None
+    desired_output = None
+    n_trials = None
+    test_duration_s = None
+    if not args.no_gui:
+        ui = prompt_launch_gui(args.desired_output, args.iters, args.test_duration_s)
+        if ui is not None:
+            action = ui["action"]
+            desired_output = float(ui["goal"])
+            n_trials = int(ui["trials"])
+            test_duration_s = float(ui["test_duration_s"])
+        else:
+            log("GUI unavailable; falling back to console prompts.")
+
+    if action is None:
+        action = prompt_launch_action()
+        if action == "start":
+            desired_output = prompt_goal_power_output(args.desired_output)
+            n_trials = prompt_trial_count(args.iters)
+
     if action == "quit":
         log("Exiting on user request.")
         return
-
-    desired_output = prompt_goal_power_output(args.desired_output)
-    log(f"Goal power output set to {desired_output:.4f}")
-    n_trials = prompt_trial_count(args.iters)
-    log(f"Configured trials: {n_trials} (total laser runs: {n_trials * 5})")
+    if action == "graph":
+        try:
+            run_graph_tool(args.power_csv, prefer_gui=(not args.no_gui))
+        except RuntimeError as e:
+            log(f"Graph tool error: {e}")
+        log("Graph tool closed.")
+        return
 
     # Open serial transport once and reuse it across the optimization run.
     log("Opening serial port")
@@ -515,6 +838,16 @@ def main():
         reset_pid_defaults(io)
         log("Defaults restored successfully.")
         return
+
+    if desired_output is None:
+        desired_output = prompt_goal_power_output(args.desired_output)
+    log(f"Goal power output set to {desired_output:.4f}")
+    if n_trials is None:
+        n_trials = prompt_trial_count(args.iters)
+    log(f"Configured trials: {n_trials} (total laser runs: {n_trials * 5})")
+    if test_duration_s is None:
+        test_duration_s = float(args.test_duration_s)
+    log(f"Configured per-test duration: {test_duration_s:.2f}s")
 
     duration = 15.0
     space = [
@@ -533,6 +866,10 @@ def main():
     last_applied = None
     no_improve_count = 0
     refine_mode = False
+    recovery_mode = False
+    recovery_exact_next = True
+    stagnation_axis = 0
+    stagnation_sign = 1.0
     step_kp = float(args.max_step_kp)
     step_ki = float(args.max_step_ki)
     step_kd = float(args.max_step_kd)
@@ -543,6 +880,8 @@ def main():
     def objective(x):
         nonlocal trial_index, baseline_score, best_score_seen, best_pid, last_applied
         nonlocal no_improve_count, refine_mode
+        nonlocal recovery_mode, recovery_exact_next
+        nonlocal stagnation_axis, stagnation_sign
         nonlocal step_kp, step_ki, step_kd
         kp, ki, kd = x
         log(f"Trial {trial_index + 1}/{n_trials}")
@@ -585,6 +924,44 @@ def main():
                     f"(from {kp_raw:.4f}, {ki_raw:.4f}, {kd_raw:.4f})"
                 )
 
+        # If score is flat, switch into local recovery around the best-known point.
+        # Recovery first re-tests best PID exactly, then probes small single-axis moves.
+        if best_pid is not None and (recovery_mode or no_improve_count >= 3):
+            if not recovery_mode:
+                recovery_mode = True
+                recovery_exact_next = True
+                log("Stagnation detected: entering local recovery around best PID")
+
+            bkp, bki, bkd = best_pid
+            if recovery_exact_next:
+                kp, ki, kd = float(bkp), float(bki), float(bkd)
+                recovery_exact_next = False
+                log(
+                    "Recovery probe -> exact best PID re-test: "
+                    f"kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}"
+                )
+            else:
+                kp, ki, kd = float(bkp), float(bki), float(bkd)
+                delta_kp = max(min_step_kp, step_kp * 0.35)
+                delta_ki = max(min_step_ki, step_ki * 0.35)
+                delta_kd = max(min_step_kd, step_kd * 0.35)
+                if stagnation_axis == 0:
+                    kp = float(np.clip(kp + (stagnation_sign * delta_kp), 0.0, args.kp_max))
+                    axis_name = "kp"
+                elif stagnation_axis == 1:
+                    ki = float(np.clip(ki + (stagnation_sign * delta_ki), 0.0, args.ki_max))
+                    axis_name = "ki"
+                else:
+                    kd = float(np.clip(kd + (stagnation_sign * delta_kd), 0.0, args.kd_max))
+                    axis_name = "kd"
+                log(
+                    "Recovery probe -> best PID with small perturbation "
+                    f"on {axis_name}: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}"
+                )
+                stagnation_axis = (stagnation_axis + 1) % 3
+                if stagnation_axis == 0:
+                    stagnation_sign *= -1.0
+
         # Use live laser PID for the first run, then apply optimized candidates.
         apply_pid_update = trial_index > 0
         t, y, u, aborted, current_pid, per_test_powers, per_test_times, per_test_meta = run_trial(
@@ -594,6 +971,7 @@ def main():
             kd,
             desired_output=desired_output,
             apply_pid_update=apply_pid_update,
+            test_duration_s=test_duration_s,
             startup_grace_s=args.startup_grace_s,
             settled_window_samples=args.settled_window_samples,
             duration=duration,
@@ -639,12 +1017,18 @@ def main():
         if improved:
             best_pid = (used_kp, used_ki, used_kd)
             no_improve_count = 0
+            recovery_mode = False
+            recovery_exact_next = True
             step_kp = max(min_step_kp, step_kp * float(args.step_shrink_factor))
             step_ki = max(min_step_ki, step_ki * float(args.step_shrink_factor))
             step_kd = max(min_step_kd, step_kd * float(args.step_shrink_factor))
         else:
             no_improve_count += 1
-            if best_improve_pct_so_far < float(args.lock_growth_after_improve_pct):
+            if recovery_mode:
+                step_kp = max(min_step_kp, step_kp * 0.95)
+                step_ki = max(min_step_ki, step_ki * 0.95)
+                step_kd = max(min_step_kd, step_kd * 0.95)
+            elif best_improve_pct_so_far < float(args.lock_growth_after_improve_pct):
                 step_kp = min(float(args.max_step_kp), step_kp * float(args.step_growth_factor))
                 step_ki = min(float(args.max_step_ki), step_ki * float(args.step_growth_factor))
                 step_kd = min(float(args.max_step_kd), step_kd * float(args.step_growth_factor))
@@ -676,10 +1060,32 @@ def main():
             )
         )
 
-        # Store every current-power reading in a separate CSV-friendly table.
-        for test_idx, (test_powers, test_times, test_meta) in enumerate(
-            zip(per_test_powers, per_test_times, per_test_meta), start=1
-        ):
+        # Store only the best repeat (out of 5 tests) for this trial.
+        # "Best" is lowest mean absolute error to desired output among valid tests.
+        best_test_idx = None
+        best_test_err = float("inf")
+        for i, (test_powers, test_meta) in enumerate(zip(per_test_powers, per_test_meta)):
+            if test_powers.size == 0:
+                continue
+            if bool(test_meta.get("invalid", False)):
+                continue
+            mae = float(np.mean(np.abs(test_powers - desired_output)))
+            if mae < best_test_err:
+                best_test_err = mae
+                best_test_idx = i
+
+        # Fallback: if all valid tests are unavailable, use the first non-empty one.
+        if best_test_idx is None:
+            for i, test_powers in enumerate(per_test_powers):
+                if test_powers.size > 0:
+                    best_test_idx = i
+                    break
+
+        if best_test_idx is not None:
+            test_idx = best_test_idx + 1
+            test_powers = per_test_powers[best_test_idx]
+            test_times = per_test_times[best_test_idx]
+            test_meta = per_test_meta[best_test_idx]
             if test_times.size == test_powers.size:
                 time_vals = test_times.tolist()
             else:
@@ -717,6 +1123,7 @@ def main():
                 bkd,
                 desired_output=desired_output,
                 apply_pid_update=True,
+                test_duration_s=test_duration_s,
                 startup_grace_s=args.startup_grace_s,
                 settled_window_samples=args.settled_window_samples,
                 duration=duration,
