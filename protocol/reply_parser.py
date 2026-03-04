@@ -1,3 +1,10 @@
+"""Parse incoming reply/telemetry lines from the laser controller.
+
+This module supports several wire formats that are seen in real hardware
+firmware revisions (legacy DATA, hex B0 debug, decimal B0 debug, and generic
+key/value telemetry).
+"""
+
 import re
 
 from protocol.frame_codec import is_framed_command
@@ -36,6 +43,7 @@ def parse_pid_reply(packet: str) -> dict:
     if not is_framed_command(packet):
         raise ValueError("Invalid packet format: expected frame starting with '$' and ending with '\\r\\n'")
 
+    # Remove trailing frame terminator so indexing is simpler.
     pkt = packet[:-2]
     if not pkt.startswith("$B6"):
         raise ValueError(f"Expected GET_PID reply ($B6...), got: {pkt[:10]}")
@@ -43,8 +51,8 @@ def parse_pid_reply(packet: str) -> dict:
         raise ValueError("Packet too short")
 
     received_checksum_str = pkt[-2:]
-    # Keep exact spacing from device reply for checksum calculation.
-    # Some controllers include leading spaces in checksum accumulation.
+    # Keep exact spacing from device reply for checksum calculation because
+    # some firmware includes those spaces in checksum accumulation.
     data_portion = pkt[3:-2]
     calculated_checksum = sum(ord(ch) for ch in data_portion) % 256
     received_checksum = int(received_checksum_str, 16)
@@ -53,6 +61,7 @@ def parse_pid_reply(packet: str) -> dict:
             f"Checksum mismatch: calculated {calculated_checksum:02X}, received {received_checksum_str}"
         )
 
+    # Split the eight numeric fields from the B6 payload.
     fields = [f.strip() for f in data_portion.split() if f.strip()]
     if len(fields) != 8:
         raise ValueError(f"Expected 8 PID parameter fields, got {len(fields)}")
@@ -77,6 +86,7 @@ def parse_ack(line: str) -> tuple[bool, str]:
     Parse controller ack like '*00'.
     Returns (is_success, code).
     """
+    # ACK format is simple: "*00" success, other codes are failure/status.
     s = (line or "").strip()
     if not s.startswith("*") or len(s) < 3:
         return False, ""
@@ -92,13 +102,16 @@ def parse_telemetry_line(line: str) -> dict | None:
       3) framed debug packet:
          $B0AAAAAAAA:BBBBBBBB:CCCCCCCC:DDDDDDDDXX
     """
+    # Normalize incoming line first.
     s = (line or "").strip()
     if not s:
         return None
 
+    # B0 hex format.
     debug_match = DEBUG_B0_RE.match(s)
     if debug_match is not None:
         a_hex, b_hex, c_hex, d_hex, rx_checksum_hex = debug_match.groups()
+        # Checksum is computed over everything after "$B0" and before trailing checksum byte.
         payload = s[3:-2]  # exact bytes after command id, before checksum
         calc_checksum = sum(ord(ch) for ch in payload) % 256
         rx_checksum = int(rx_checksum_hex, 16)
@@ -113,7 +126,7 @@ def parse_telemetry_line(line: str) -> dict | None:
             "status": "RUNNING",
         }
 
-    # Decimal debug stream variant:
+    # Decimal B0 variant seen on some firmware:
     #   $B0 514.00: 519.33: 66.188: 100.00033
     debug_dec_match = DEBUG_B0_DEC_RE.match(s)
     if debug_dec_match is not None:
@@ -142,8 +155,7 @@ def parse_telemetry_line(line: str) -> dict | None:
             "status": status,
         }
 
-    # New packet style: key/value fields that include initial/current power
-    # plus pulse period/width.
+    # Generic key/value telemetry fallback.
     kv = {k.strip().lower(): float(v) for k, v in KV_RE.findall(s)}
 
     def first(keys: tuple[str, ...]) -> float | None:

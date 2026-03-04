@@ -1,18 +1,25 @@
+"""Convert parsed telemetry packets into a common shape used by the tuner.
+
+The optimization/scoring code expects a single dictionary format no matter
+which telemetry packet type the laser emitted.
+"""
+
+
 def map_telemetry_values(raw: dict) -> dict:
-    """
-    Central place to map raw telemetry values to usable engineering values.
+    """Normalize one telemetry sample into fields the rest of the app uses.
 
-    Legacy DATA mode:
-      uses y/u directly.
-
-    Power packet mode (B0 debug):
-      uses current_power directly as process_value so tuning/logging tracks
-      the power being reported by the laser.
+    Why this exists:
+    - The controller can send multiple packet styles.
+    - Later code should not care about packet style details.
+    - This function gives everything a single, predictable format.
     """
+    # B0 debug packets include explicit power and pulse information.
     if "initial_power" in raw and "current_power" in raw:
         pulse_period = float(raw["pulse_period"])
         pulse_width = float(raw["pulse_width"])
+        # Duty cycle is "how much of each pulse period is ON".
         duty_cycle = (pulse_width / pulse_period) if pulse_period > 0 else 0.0
+        # For power tuning, process value should be actual measured power.
         process_value = float(raw["current_power"])
         return {
             "time_s": float(raw["t"]) if raw.get("t") is not None else None,
@@ -26,6 +33,7 @@ def map_telemetry_values(raw: dict) -> dict:
             "duty_cycle": duty_cycle,
         }
 
+    # Legacy "DATA ..." packets already expose process output directly as y/u.
     return {
         "time_s": float(raw["t"]),
         "process_value": float(raw["y"]),

@@ -1,3 +1,9 @@
+"""Read live telemetry lines and turn them into trial-ready arrays.
+
+This file is intentionally small: it owns the read loop and leaves protocol
+parsing/mapping to the dedicated protocol/domain layers.
+"""
+
 import time
 
 from protocol.reply_parser import parse_telemetry_line
@@ -14,40 +20,49 @@ def collect_trial_data(
     on_sample=None,
     on_done=None,
 ):
-    """
-    Collect trial telemetry.
+    """Collect one block of telemetry samples from the serial stream.
 
-    If duration_s is provided, collect for that time window.
-    Otherwise collect until 'OK DONE'.
-    Returns (t_vals, y_vals, u_vals, status_vals).
+    Output format:
+    - t_vals: time values per sample
+    - y_vals: measured process values (power)
+    - u_vals: control output values
+    - status_vals: status text per sample
 
-    If telemetry does not include explicit time, time is synthesized using
-    sample_interval_s (or sample index fallback).
+    Stop conditions:
+    - fixed duration has elapsed (if duration_s is set), or
+    - device says "OK DONE" and stop_on_done=True, or
+    - callback requests early stop.
     """
+    # We build plain Python lists first because append-in-a-loop is fast/safe.
     t_vals, y_vals, u_vals, status_vals = [], [], [], []
     sample_idx = 0
     t_start = time.monotonic()
 
     while True:
+        # Time-window mode: leave once the requested capture time has passed.
         if duration_s is not None and (time.monotonic() - t_start) >= duration_s:
             break
 
         try:
             line = io.read_line(timeout=line_timeout)
         except TimeoutError:
-            # During fixed-duration collection, occasional read timeouts are fine.
+            # Timeouts are expected sometimes on serial links, so keep waiting.
             continue
 
         line_s = line.strip()
 
+        # Try to decode this line as a telemetry sample.
         telemetry = parse_telemetry_line(line_s)
         if telemetry is not None:
             mapped = map_telemetry_values(telemetry)
             mapped_t = mapped.get("time_s")
             if mapped_t is None:
+                # Some packet formats do not include explicit time.
+                # In that case, synthesize time from sample interval if known.
                 if sample_interval_s is not None and sample_interval_s > 0:
                     t_val = float(sample_idx) * float(sample_interval_s)
                 else:
+                    # Last fallback: use sample count as a coarse timeline.
                     t_val = float(sample_idx)
             else:
                 t_val = float(mapped_t)
@@ -59,11 +74,13 @@ def collect_trial_data(
             sample_idx += 1
 
             if on_sample is not None:
+                # Caller can stop collection immediately (for safety conditions).
                 stop_now = bool(on_sample(t_val, mapped))
                 if stop_now:
                     break
             continue
 
+        # Some firmware flows indicate trial completion with this line.
         if line_s.startswith("OK DONE"):
             if on_done:
                 on_done()
@@ -71,6 +88,7 @@ def collect_trial_data(
                 break
             continue
 
+        # Device-reported errors should stop the trial immediately.
         if line_s.startswith("ERR"):
             raise RuntimeError(line_s)
 

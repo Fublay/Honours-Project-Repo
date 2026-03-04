@@ -1,3 +1,9 @@
+"""Serial transport implementation used by the PID tuner.
+
+`SerialLineIO` is the boundary between business logic and the pyserial device.
+It knows how to frame commands, read full lines, and wait for ACK/PID replies.
+"""
+
 import time
 import serial
 
@@ -34,16 +40,19 @@ class SerialLineIO:
         self.checksum_fn = checksum_fn
 
     def write_command(self, data: str, *, command_id_hex2: str | None = None) -> None:
+        """Send one framed command to the controller."""
         cid = self.default_command_id_hex2 if command_id_hex2 is None else str(command_id_hex2).strip().upper()
         framed = compose_frame(cid, data, checksum_fn=self.checksum_fn)
         self.log_fn(f"TX -> {framed!r}")
         self.ser.write(framed)
 
     def read_line(self, timeout: float = 2.0, keep_terminator: bool = False) -> str:
+        """Read one complete line from serial, preserving partial chunks safely."""
         t0 = time.time()
 
         while time.time() - t0 < timeout:
             if b"\n" in self.buf:
+                # Consume exactly one line from the internal buffer.
                 line_bytes, self.buf = self.buf.split(b"\n", 1)
                 raw_line = (line_bytes + b"\n").decode("ascii", errors="ignore")
                 line = raw_line.rstrip("\r\n")
@@ -59,6 +68,7 @@ class SerialLineIO:
                     return raw_line
                 return line
 
+            # Pull more bytes from serial and append to buffer.
             chunk = self.ser.read(256)
             if chunk:
                 self.buf += chunk
@@ -68,6 +78,7 @@ class SerialLineIO:
         raise TimeoutError("Timed out waiting for serial data")
 
     def get_pid_values(self, timeout: float = 2.0) -> dict:
+        """Send GET_PID and wait until a valid B6 reply is parsed."""
         cmd_bytes = compose_frame("B6", "", checksum_fn=self.checksum_fn)
         self.log_fn(f"TX -> {cmd_bytes!r}")
         self.ser.write(cmd_bytes)
@@ -83,7 +94,7 @@ class SerialLineIO:
                 return parse_pid_reply(reply)
             except Exception as e:
                 last_error = e
-                # Ignore unrelated frames/lines (e.g. debug stream) while waiting for $B6 reply.
+                # Ignore unrelated lines (for example debug telemetry) while waiting for B6.
                 continue
 
         if last_error is not None:
@@ -111,6 +122,7 @@ class SerialLineIO:
                 break
             line = self.read_line(timeout=remaining)
             _, code = parse_ack(line)
+            # Ignore non-ACK traffic while we wait for command confirmation.
             if not line.startswith("*"):
                 continue
             if code in accepted_codes:
@@ -133,6 +145,9 @@ class SerialLineIO:
         current_values: dict | None = None,
         timeout: float = 2.0,
     ) -> str:
+        """Build and send SET_PID, returning the immediate ACK line."""
+        # If caller did not pass current values, try to read them first so that
+        # untouched fields can be preserved by the composer.
         if current_values is None:
             try:
                 current_values = self.get_pid_values(timeout=timeout)

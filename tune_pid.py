@@ -1,3 +1,13 @@
+"""Main application entry point for laser PID tuning.
+
+This script provides:
+- startup UI (GUI/CLI) for running actions
+- serial command orchestration for each laser test
+- trial scoring and Bayesian optimization
+- CSV output for later analysis
+- interactive graphing of stored power traces
+"""
+
 import csv
 from datetime import datetime
 
@@ -66,6 +76,11 @@ def prompt_trial_count(default_value: int) -> int:
 
 
 def prompt_launch_gui(default_goal: float, default_trials: int, default_test_duration_s: float):
+    """Show the startup GUI and return selected action + field values.
+
+    Return shape:
+        {"action": "start|reset|graph|quit", "goal": float, "trials": int, "test_duration_s": float}
+    """
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -165,6 +180,7 @@ def prompt_launch_gui(default_goal: float, default_trials: int, default_test_dur
 
 
 def load_power_series(csv_path: str):
+    """Load saved power CSV rows and group them by (trial_index, test_index)."""
     series_map = {}
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -194,6 +210,7 @@ def load_power_series(csv_path: str):
 
 
 def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tuple[int, int] | None = None):
+    """Plot one or two selected test traces from CSV data."""
     import matplotlib.pyplot as plt
 
     series = load_power_series(csv_path)
@@ -205,7 +222,7 @@ def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tupl
     fig, ax = plt.subplots(figsize=(10, 5))
     first = series[first_key]
     ax.plot(first["time_s"], first["power"], label=f"Trial {first_key[0]} Test {first_key[1]}")
-    ax.axhline(first["goal"], linestyle="--", linewidth=1.2, alpha=525.0, label=f"Goal {first['goal']:.2f}")
+    ax.axhline(first["goal"], linestyle="--", linewidth=1.2, alpha=0.8, label=f"Goal {first['goal']:.2f}")
 
     if second_key is not None:
         second = series[second_key]
@@ -215,7 +232,7 @@ def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tupl
                 second["goal"],
                 linestyle=":",
                 linewidth=1.2,
-                alpha=525.0,
+                alpha=0.8,
                 label=f"Goal 2 {second['goal']:.2f}",
             )
 
@@ -230,6 +247,7 @@ def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tupl
 
 
 def plot_power_tests_interactive(csv_path: str):
+    """Open interactive graph window with checkbox-based test visibility control."""
     import matplotlib.pyplot as plt
     from matplotlib.widgets import Button, CheckButtons
 
@@ -341,6 +359,7 @@ def plot_power_tests_interactive(csv_path: str):
 
 
 def run_graph_tool(csv_path: str, prefer_gui: bool = True):
+    """Run graph view workflow and surface readable errors for missing dependencies."""
     try:
         series = load_power_series(csv_path)
     except FileNotFoundError:
@@ -363,6 +382,7 @@ def run_graph_tool(csv_path: str, prefer_gui: bool = True):
 
 
 def reset_pid_defaults(io: SerialLineIO) -> None:
+    """Write known-safe default PID values back to the controller."""
     ack = io.set_pid_values(
         pw_kp=0.15,
         pw_ki=0.14,
@@ -399,6 +419,11 @@ def run_trial(
     ki_max: float = 1.0,
     kd_max: float = 0.2,
 ):
+    """Run one PID candidate through repeated laser tests and collect telemetry.
+
+    A "trial" in this project means one PID tuple (kp, ki, kd) tested several
+    times (`repeats`) so scoring is less sensitive to one noisy run.
+    """
     _ = duration  # Kept for CLI compatibility with older call sites.
     log(f"Starting trial: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
 
@@ -656,6 +681,7 @@ def compute_trial_metrics(
     per_test_meta: list[dict],
     desired_output: float,
 ):
+    """Convert per-test power arrays into aggregate metrics used for scoring."""
     start_errors = []
     track_errors = []
     deviations = []
@@ -721,6 +747,7 @@ def score_controller(
     invalid_penalty: float,
     aborted: bool,
 ):
+    """Combine metric values into one scalar score (lower is better)."""
     score = (
         w_start * metrics["start_error"]
         + w_track * metrics["track_error"]
@@ -737,6 +764,7 @@ def score_controller(
 
 
 def main():
+    """Parse inputs, run selected action, and manage full tuning workflow."""
     import argparse
 
     # Runtime arguments for serial connection, optimizer bounds, and target output.
