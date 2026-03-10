@@ -8,8 +8,8 @@ import time
 import serial
 
 from protocol.frame_codec import compose_frame, default_checksum_hex_2
-from protocol.command_composer import compose_set_pid_command
-from protocol.reply_parser import parse_ack, parse_pid_reply
+from protocol.command_composer import compose_set_pid_command, compose_set_program_command
+from protocol.reply_parser import parse_ack, parse_pid_reply, parse_program_reply
 
 
 class SerialLineIO:
@@ -101,6 +101,29 @@ class SerialLineIO:
             raise ValueError(f"Failed to parse GET_PID reply before timeout: {last_error}")
         raise TimeoutError("Timed out waiting for GET_PID reply")
 
+    def get_program_values(self, timeout: float = 2.0) -> dict:
+        """Send GET_PROGRAM and wait until a valid 41 reply is parsed."""
+        cmd_bytes = compose_frame("41", "00", checksum_fn=self.checksum_fn)
+        self.log_fn(f"TX -> {cmd_bytes!r}")
+        self.ser.write(cmd_bytes)
+        deadline = time.time() + timeout
+        last_error = None
+
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            reply = self.read_line(timeout=remaining, keep_terminator=True)
+            try:
+                return parse_program_reply(reply)
+            except Exception as e:
+                last_error = e
+                continue
+
+        if last_error is not None:
+            raise ValueError(f"Failed to parse GET_PROGRAM reply before timeout: {last_error}")
+        raise TimeoutError("Timed out waiting for GET_PROGRAM reply")
+
     def write_command_expect_ok_ack(
         self,
         data: str,
@@ -167,6 +190,38 @@ class SerialLineIO:
             checksum_fn=self.checksum_fn,
         )
 
+        self.log_fn(f"TX -> {cmd_bytes!r}")
+        self.ser.write(cmd_bytes)
+        ack = self.read_line(timeout=timeout)
+        return ack
+
+    def set_program_values(
+        self,
+        *,
+        power_w: float,
+        frequency_khz: float,
+        program_id: int | None = 0,
+        pulse_width_us: int | None = 0,
+        detect_delay_us: int | None = 0,
+        current_values: dict | None = None,
+        timeout: float = 2.0,
+    ) -> str:
+        """Build and send SET_PROGRAM, returning the immediate ACK line."""
+        if current_values is None:
+            try:
+                current_values = self.get_program_values(timeout=timeout)
+            except Exception:
+                current_values = None
+
+        cmd_bytes = compose_set_program_command(
+            power_w=power_w,
+            frequency_khz=frequency_khz,
+            program_id=program_id,
+            pulse_width_us=pulse_width_us,
+            detect_delay_us=detect_delay_us,
+            current_values=current_values,
+            checksum_fn=self.checksum_fn,
+        )
         self.log_fn(f"TX -> {cmd_bytes!r}")
         self.ser.write(cmd_bytes)
         ack = self.read_line(timeout=timeout)

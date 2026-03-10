@@ -81,6 +81,44 @@ def parse_pid_reply(packet: str) -> dict:
         raise ValueError(f"Failed to parse PID values: {e}")
 
 
+def parse_program_reply(packet: str) -> dict:
+    """
+    Parse a GET_PROGRAM reply packet.
+    Format: $41AAPPPPFFFFWWWWDDDDDDDDCC\r\n
+    """
+    if not isinstance(packet, str):
+        raise TypeError("packet must be a str")
+    if not is_framed_command(packet):
+        raise ValueError("Invalid packet format: expected frame starting with '$' and ending with '\\r\\n'")
+
+    pkt = packet[:-2]
+    if not pkt.startswith("$41"):
+        raise ValueError(f"Expected GET_PROGRAM reply ($41...), got: {pkt[:10]}")
+
+    received_checksum_str = pkt[-2:]
+    data_portion = pkt[3:-2]
+    if len(data_portion) != 22:
+        raise ValueError(f"Expected 22 characters in GET_PROGRAM payload, got {len(data_portion)}")
+
+    calculated_checksum = sum(ord(ch) for ch in data_portion) % 256
+    received_checksum = int(received_checksum_str, 16)
+    if calculated_checksum != received_checksum:
+        raise ValueError(
+            f"Checksum mismatch: calculated {calculated_checksum:02X}, received {received_checksum_str}"
+        )
+
+    try:
+        return {
+            "program_id": int(data_portion[0:2]),
+            "power_w": int(data_portion[2:6]),
+            "frequency_khz": int(data_portion[6:10]),
+            "pulse_width_us": int(data_portion[10:14]),
+            "detect_delay_us": int(data_portion[14:22]),
+        }
+    except ValueError as e:
+        raise ValueError(f"Failed to parse GET_PROGRAM reply: {e}")
+
+
 def parse_ack(line: str) -> tuple[bool, str]:
     """
     Parse controller ack like '*00'.

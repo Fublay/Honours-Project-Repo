@@ -27,3 +27,7 @@ TRIGGER = "77"
 
 # Enable/disable debug output masks (for example B0 telemetry stream).
 SET_DEBUG = "0F"
+
+# Program setup command used to set power/frequency fields before firing.
+SET_PROGRAM = "40"
+GET_PROGRAM = "41"
