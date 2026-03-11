@@ -3,7 +3,7 @@
 This script provides:
 - startup UI (GUI/CLI) for running actions
 - serial command orchestration for each laser test
-- trial scoring and Bayesian optimization
+- trial scoring and hybrid PID tuning
 - CSV output for later analysis
 - interactive graphing of stored power traces
 """
@@ -25,6 +25,9 @@ from ui.graphing import RuntimeMonitor, prompt_launch_gui, run_graph_tool
 
 class EarlyStopOptimization(RuntimeError):
     pass
+
+
+AXIS_NAMES = ("kp", "ki", "kd")
 
 
 # Print log lines with a simple HH:MM:SS timestamp.
@@ -179,6 +182,11 @@ def run_trial(
     kd_max: float = 0.2,
     monitor: RuntimeMonitor | None = None,
     trial_index: int | None = None,
+    phase_name: str | None = None,
+    phase_trial_index: int | None = None,
+    phase_trial_total: int | None = None,
+    overall_trial_index: int | None = None,
+    repeat_cancel_osc_threshold: float = 0.35,
 ):
     """Run one PID candidate through repeated laser tests and collect telemetry.
 
@@ -246,14 +254,24 @@ def run_trial(
     if monitor is not None:
         monitor.set_target(desired_output)
         monitor.set_pid_values(display_kp, display_ki, display_kd)
-        if trial_index is not None:
-            monitor.set_status(f"Trial {trial_index}: configuring hardware")
+        if phase_name is not None and phase_trial_index is not None:
+            progress = f"{phase_name} trial {phase_trial_index}"
+            if phase_trial_total is not None:
+                progress = f"{progress}/{phase_trial_total}"
+            if overall_trial_index is not None:
+                progress = f"{progress} | overall {overall_trial_index}"
+            monitor.set_progress(f"{progress} | configuring hardware")
+        elif trial_index is not None:
+            monitor.set_progress(f"Trial {trial_index} | configuring hardware")
 
     # Prepare output arrays for all repeats under this PID candidate.
     t_vals, y_vals, u_vals, status_vals = [], [], [], []
     per_test_powers: list[np.ndarray] = []
     per_test_times: list[np.ndarray] = []
     per_test_meta: list[dict] = []
+    repeat_scores: list[float] = []
+    cancelled_candidate = False
+    cancel_reason = ""
 
     # Put the laser into run mode and open shutter before individual test starts.
     io.write_command_expect_ok_ack("", command_id_hex2=CMD.RUN, timeout=2.0)
@@ -265,9 +283,12 @@ def run_trial(
             log(f"Test {rep + 1}/{repeats}: START")
             if monitor is not None:
                 monitor.begin_test(
-                    trial_index=(trial_index or 0),
+                    phase_name=(phase_name or "Trial"),
+                    phase_trial_index=(phase_trial_index or trial_index or 0),
+                    phase_trial_total=phase_trial_total,
                     repeat_index=rep + 1,
                     repeats=repeats,
+                    overall_trial_index=overall_trial_index,
                 )
             io.write_command_expect_ok_ack(
                 "",
@@ -408,6 +429,8 @@ def run_trial(
                 test_meta["reason"] = "did not settle"
 
             per_test_meta.append(test_meta)
+            repeat_score = score_single_repeat(per_test_powers[-1], test_meta, desired_output)
+            repeat_scores.append(repeat_score)
 
             # Print quick power stats for this repeat to spot unstable behavior.
             if ry:
@@ -426,13 +449,40 @@ def run_trial(
             elif test_meta["reason"]:
                 log(f"Test {rep + 1}/{repeats} note: {test_meta['reason']}")
 
+            if rep >= 1:
+                prev_repeat_score = repeat_scores[-2]
+                if test_meta["oscillation_rate"] >= repeat_cancel_osc_threshold:
+                    cancelled_candidate = True
+                    cancel_reason = (
+                        f"repeat {rep + 1} oscillation too high "
+                        f"({test_meta['oscillation_rate']:.3f} >= {repeat_cancel_osc_threshold:.3f})"
+                    )
+                elif repeat_score > prev_repeat_score:
+                    cancelled_candidate = True
+                    cancel_reason = (
+                        f"repeat {rep + 1} score regressed "
+                        f"({repeat_score:.3f} > {prev_repeat_score:.3f})"
+                    )
+
             if not test_meta["stopped_early"]:
                 io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
                 log(f"Test {rep + 1}/{repeats}: STOP")
                 if monitor is not None:
-                    monitor.set_status(f"Trial {trial_index}: test {rep + 1}/{repeats} stopped")
+                    if phase_name is not None and phase_trial_index is not None:
+                        progress = f"{phase_name} trial {phase_trial_index}"
+                        if phase_trial_total is not None:
+                            progress = f"{progress}/{phase_trial_total}"
+                        if overall_trial_index is not None:
+                            progress = f"{progress} | overall {overall_trial_index}"
+                        monitor.set_progress(f"{progress} | test {rep + 1}/{repeats} stopped")
+                    elif trial_index is not None:
+                        monitor.set_progress(f"Trial {trial_index} | test {rep + 1}/{repeats} stopped")
             else:
                 log(f"Test {rep + 1}/{repeats}: STOP (already sent on invalid condition)")
+
+            if cancelled_candidate:
+                log(f"Cancelling remaining repeats for this PID candidate: {cancel_reason}")
+                break
     finally:
         # Always leave hardware in a safe idle state at end of a candidate.
         try:
@@ -443,11 +493,21 @@ def run_trial(
         io.write_command_expect_ok_ack("", command_id_hex2=CMD.STANDBY, timeout=2.0)
         log("End of PID set: shutter closed, standby set")
         if monitor is not None:
-            monitor.set_status(f"Trial {trial_index}: shutter closed, standby set")
+            if phase_name is not None and phase_trial_index is not None:
+                progress = f"{phase_name} trial {phase_trial_index}"
+                if phase_trial_total is not None:
+                    progress = f"{progress}/{phase_trial_total}"
+                if overall_trial_index is not None:
+                    progress = f"{progress} | overall {overall_trial_index}"
+                monitor.set_progress(f"{progress} | shutter closed, standby set")
+            elif trial_index is not None:
+                monitor.set_progress(f"Trial {trial_index} | shutter closed, standby set")
 
     aborted = any(s == "ABORT" for s in status_vals)
     if aborted:
         log("Warning: Trial aborted due to safety condition")
+    if cancelled_candidate:
+        log(f"Trial ended early after repeated-test regression: {cancel_reason}")
 
     return (
         np.array(t_vals),
@@ -458,6 +518,8 @@ def run_trial(
         per_test_powers,
         per_test_times,
         per_test_meta,
+        cancelled_candidate,
+        cancel_reason,
     )
 
 
@@ -519,7 +581,23 @@ def compute_trial_metrics(
     }
 
 
-# Convert weighted metrics into one scalar objective for Bayesian optimization.
+def score_single_repeat(readings: np.ndarray, meta: dict, desired_output: float) -> float:
+    """Score one repeat quickly so unstable candidates can be stopped early."""
+    if readings.size == 0:
+        return 999.0
+
+    start_power = float(readings[0])
+    abs_error = np.abs(readings - desired_output)
+    start_error = abs(start_power - desired_output)
+    track_error = float(np.mean(abs_error))
+    deviation = float(np.std(readings))
+    max_error = float(np.max(abs_error))
+    strict_bad_rate = float(meta.get("strict_bad_rate", 1.0))
+    oscillation_rate = float(meta.get("oscillation_rate", 1.0))
+    return start_error + track_error + deviation + max_error + strict_bad_rate + oscillation_rate
+
+
+# Convert weighted metrics into one scalar objective for PID candidate comparison.
 def score_controller(
     metrics: dict,
     *,
@@ -549,15 +627,209 @@ def score_controller(
     return float(score)
 
 
+def propose_coordinate_candidate(
+    base_pid: tuple[float, float, float],
+    axis_index: int,
+    axis_direction: float,
+    *,
+    step_kp: float,
+    step_ki: float,
+    step_kd: float,
+    kp_max: float,
+    ki_max: float,
+    kd_max: float,
+) -> tuple[tuple[float, float, float], int, float, float]:
+    """Adjust exactly one PID term from the current base point."""
+    values = [float(base_pid[0]), float(base_pid[1]), float(base_pid[2])]
+    step_sizes = [float(step_kp), float(step_ki), float(step_kd)]
+    max_values = [float(kp_max), float(ki_max), float(kd_max)]
+
+    used_axis = int(axis_index) % 3
+    direction = 1.0 if axis_direction >= 0 else -1.0
+    delta = direction * step_sizes[used_axis]
+    proposed_value = float(np.clip(values[used_axis] + delta, 0.0, max_values[used_axis]))
+
+    if np.isclose(proposed_value, values[used_axis]):
+        direction *= -1.0
+        delta = direction * step_sizes[used_axis]
+        proposed_value = float(np.clip(values[used_axis] + delta, 0.0, max_values[used_axis]))
+
+    values[used_axis] = proposed_value
+    actual_delta = values[used_axis] - base_pid[used_axis]
+    return (values[0], values[1], values[2]), used_axis, direction, float(actual_delta)
+
+
+def candidate_is_safe(
+    metrics: dict,
+    *,
+    cancelled_candidate: bool,
+    aborted: bool,
+    max_invalid_ratio: float,
+    max_oscillation_rate: float,
+) -> bool:
+    """Gate Bayesian search until the warmup has produced stable candidates."""
+    if cancelled_candidate or aborted:
+        return False
+    if float(metrics.get("invalid_ratio", 1.0)) > max_invalid_ratio:
+        return False
+    if float(metrics.get("oscillation_rate", 1.0)) > max_oscillation_rate:
+        return False
+    return True
+
+
+def candidate_is_good(
+    metrics: dict,
+    score: float,
+    *,
+    cancelled_candidate: bool,
+    aborted: bool,
+    baseline_score: float | None,
+    max_invalid_ratio: float,
+    max_oscillation_rate: float,
+    max_score_factor: float,
+) -> bool:
+    """Require stability plus a score near or better than the baseline."""
+    if not candidate_is_safe(
+        metrics,
+        cancelled_candidate=cancelled_candidate,
+        aborted=aborted,
+        max_invalid_ratio=max_invalid_ratio,
+        max_oscillation_rate=max_oscillation_rate,
+    ):
+        return False
+    if baseline_score is None or baseline_score <= 0:
+        return True
+    return float(score) <= (float(baseline_score) * float(max_score_factor))
+
+
+def assess_bayes_region(
+    safe_points: list[tuple[float, float, float]],
+    good_points: list[tuple[float, float, float]],
+    *,
+    min_safe_candidates: int,
+    min_points_per_axis: int,
+    min_good_candidates: int,
+    min_span_kp: float,
+    min_span_ki: float,
+    min_span_kd: float,
+) -> dict:
+    """Decide whether the warmup has mapped a usable local region for BO."""
+    if not safe_points:
+        return {
+            "ready": False,
+            "reason": "no safe candidates yet",
+            "unique_counts": (0, 0, 0),
+            "spans": (0.0, 0.0, 0.0),
+        }
+
+    safe_arr = np.asarray(safe_points, dtype=float)
+    unique_counts = tuple(int(len(np.unique(np.round(safe_arr[:, idx], 6)))) for idx in range(3))
+    spans = tuple(float(np.max(safe_arr[:, idx]) - np.min(safe_arr[:, idx])) for idx in range(3))
+    required_spans = (float(min_span_kp), float(min_span_ki), float(min_span_kd))
+
+    if len(safe_points) < int(min_safe_candidates):
+        return {
+            "ready": False,
+            "reason": f"only {len(safe_points)} safe candidates",
+            "unique_counts": unique_counts,
+            "spans": spans,
+        }
+
+    if len(good_points) < int(min_good_candidates):
+        return {
+            "ready": False,
+            "reason": f"only {len(good_points)} good candidates",
+            "unique_counts": unique_counts,
+            "spans": spans,
+        }
+
+    for axis_name, unique_count in zip(AXIS_NAMES, unique_counts):
+        if unique_count < int(min_points_per_axis):
+            return {
+                "ready": False,
+                "reason": f"{axis_name} has only {unique_count} safe points",
+                "unique_counts": unique_counts,
+                "spans": spans,
+            }
+
+    for axis_name, span, required in zip(AXIS_NAMES, spans, required_spans):
+        if span < required:
+            return {
+                "ready": False,
+                "reason": f"{axis_name} span {span:.4f} < {required:.4f}",
+                "unique_counts": unique_counts,
+                "spans": spans,
+            }
+
+    return {
+        "ready": True,
+        "reason": "safe local region established",
+        "unique_counts": unique_counts,
+        "spans": spans,
+    }
+
+
+def build_bayes_search_space(
+    safe_pids: list[tuple[float, float, float]],
+    *,
+    kp_max: float,
+    ki_max: float,
+    kd_max: float,
+    pad_kp: float,
+    pad_ki: float,
+    pad_kd: float,
+) -> list[Real]:
+    """Build a local Bayesian search box around the safe region from coordinate search."""
+    if not safe_pids:
+        return [
+            Real(0.0, kp_max, name="kp"),
+            Real(0.0, ki_max, name="ki"),
+            Real(0.0, kd_max, name="kd"),
+        ]
+
+    mins = np.min(np.asarray(safe_pids, dtype=float), axis=0)
+    maxs = np.max(np.asarray(safe_pids, dtype=float), axis=0)
+    pads = np.asarray([pad_kp, pad_ki, pad_kd], dtype=float)
+    bounds_max = np.asarray([kp_max, ki_max, kd_max], dtype=float)
+    lower = np.clip(mins - pads, 0.0, bounds_max)
+    upper = np.clip(maxs + pads, 0.0, bounds_max)
+
+    for idx in range(3):
+        if upper[idx] <= lower[idx]:
+            upper[idx] = min(bounds_max[idx], lower[idx] + max(pads[idx], 1e-3))
+            lower[idx] = max(0.0, upper[idx] - max(pads[idx], 1e-3))
+
+    return [
+        Real(float(lower[0]), float(upper[0]), name="kp"),
+        Real(float(lower[1]), float(upper[1]), name="ki"),
+        Real(float(lower[2]), float(upper[2]), name="kd"),
+    ]
+
+
+def filter_seed_points_for_space(
+    points: list[tuple[float, float, float]],
+    scores: list[float],
+    space: list[Real],
+) -> tuple[list[list[float]], list[float]]:
+    """Keep only warmup observations that fit inside the Bayesian local box."""
+    filtered_points: list[list[float]] = []
+    filtered_scores: list[float] = []
+    for point, score in zip(points, scores):
+        if all(dim.low <= value <= dim.high for dim, value in zip(space, point)):
+            filtered_points.append([float(point[0]), float(point[1]), float(point[2])])
+            filtered_scores.append(float(score))
+    return filtered_points, filtered_scores
+
+
 def main():
     """Parse inputs, run selected action, and manage full tuning workflow."""
     import argparse
 
-    # Runtime arguments for serial connection, optimizer bounds, and target output.
+    # Runtime arguments for serial connection, tuning bounds, and target output.
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--iters", type=int, default=20, help="Number of optimisation iterations")
+    ap.add_argument("--iters", type=int, default=20, help="Number of tuning trials")
     ap.add_argument("--log-data", action="store_true", help="Log some DATA lines too (can be spammy)")
     ap.add_argument("--log-data-every", type=int, default=50, help="If --log-data, log every Nth DATA line")
     ap.add_argument("--kp-max", type=float, default=1.0, help="Upper limit for Kp search/clamp")
@@ -579,6 +851,72 @@ def main():
     ap.add_argument("--max-step-kd", type=float, default=0.05, help="Max per-trial change in Kd")
     ap.add_argument("--step-shrink-factor", type=float, default=0.85, help="Step multiplier on new best score")
     ap.add_argument("--step-growth-factor", type=float, default=1.05, help="Step multiplier when not improving")
+    ap.add_argument(
+        "--coordinate-warmup-trials",
+        type=int,
+        default=9,
+        help="Minimum one-axis-at-a-time trials before Bayesian optimisation is allowed to start",
+    )
+    ap.add_argument(
+        "--bayes-min-safe-trials",
+        type=int,
+        default=4,
+        help="Minimum number of safe warmup trials required before Bayesian optimisation starts",
+    )
+    ap.add_argument(
+        "--bayes-region-min-points-per-axis",
+        type=int,
+        default=3,
+        help="Minimum number of distinct safe values required on each PID axis before Bayesian optimisation starts",
+    )
+    ap.add_argument(
+        "--bayes-region-min-good-candidates",
+        type=int,
+        default=2,
+        help="Minimum number of stable, reasonably accurate warmup candidates required before Bayesian optimisation starts",
+    )
+    ap.add_argument(
+        "--bayes-region-good-score-factor",
+        type=float,
+        default=1.05,
+        help="Warmup candidate counts as good if its score is at most this multiple of the baseline score",
+    )
+    ap.add_argument(
+        "--bayes-region-min-span-kp",
+        type=float,
+        default=0.05,
+        help="Minimum safe Kp span required before Bayesian optimisation starts",
+    )
+    ap.add_argument(
+        "--bayes-region-min-span-ki",
+        type=float,
+        default=0.05,
+        help="Minimum safe Ki span required before Bayesian optimisation starts",
+    )
+    ap.add_argument(
+        "--bayes-region-min-span-kd",
+        type=float,
+        default=0.01,
+        help="Minimum safe Kd span required before Bayesian optimisation starts",
+    )
+    ap.add_argument(
+        "--bayes-safe-invalid-ratio",
+        type=float,
+        default=0.20,
+        help="Maximum invalid ratio a warmup trial can have and still count as safe for Bayesian startup",
+    )
+    ap.add_argument(
+        "--bayes-safe-oscillation-rate",
+        type=float,
+        default=0.20,
+        help="Maximum oscillation rate a warmup trial can have and still count as safe for Bayesian startup",
+    )
+    ap.add_argument(
+        "--repeat-cancel-osc-threshold",
+        type=float,
+        default=0.35,
+        help="Cancel remaining repeats for a PID candidate when oscillation rate meets or exceeds this value",
+    )
     ap.add_argument(
         "--lock-growth-after-improve-pct",
         type=float,
@@ -604,14 +942,25 @@ def main():
     ap.add_argument("--no-gui", action="store_true", help="Disable launch GUI and use console prompts")
     ap.add_argument("--power-csv", default="tuning_power_readings.csv", help="CSV file for graphing power readings")
     ap.add_argument("--test-duration-s", type=float, default=12.0, help="Seconds per individual laser test")
+    ap.add_argument(
+        "--warmup-repeats",
+        type=int,
+        default=3,
+        help="Number of repeated tests per candidate during candidate gathering",
+    )
+    ap.add_argument(
+        "--bo-repeats",
+        type=int,
+        default=5,
+        help="Number of repeated tests per candidate during Bayesian optimisation",
+    )
     ap.add_argument("--frequency-khz", type=int, default=0, help="Laser frequency in kHz for the startup program command")
     args = ap.parse_args()
 
     default_goal = float(args.desired_output)
     default_frequency_khz = int(args.frequency_khz)
-    startup_ser = None
-    startup_io = None
     if args.port:
+        startup_ser = None
         try:
             startup_ser = serial.Serial(args.port, args.baud, timeout=0.1)
             startup_io = SerialLineIO(
@@ -627,63 +976,53 @@ def main():
             )
         except Exception as e:
             log(f"Warning: Could not open serial port for startup defaults: {e}")
+        finally:
             if startup_ser is not None:
                 startup_ser.close()
-            startup_ser = None
-            startup_io = None
 
-    action = None
-    desired_output = None
-    n_trials = None
-    test_duration_s = None
-    frequency_khz = None
-    monitor = None
-    if not args.no_gui:
-        ui = prompt_launch_gui(default_goal, args.iters, args.test_duration_s, default_frequency_khz)
-        if ui is not None:
-            action = ui["action"]
-            desired_output = float(ui["goal"])
-            n_trials = int(ui["trials"])
-            test_duration_s = float(ui["test_duration_s"])
-            frequency_khz = int(ui["frequency_khz"])
-            if action == "start" and ui.get("root") is not None:
-                monitor = RuntimeMonitor(ui["root"], desired_output=desired_output)
-        else:
-            log("GUI unavailable; falling back to console prompts.")
+    root = None
+    while True:
+        action = None
+        desired_output = None
+        n_trials = None
+        test_duration_s = None
+        frequency_khz = None
+        monitor = None
+        if not args.no_gui:
+            ui = prompt_launch_gui(default_goal, args.iters, args.test_duration_s, default_frequency_khz, root=root)
+            if ui is not None:
+                root = ui.get("root")
+                action = ui["action"]
+                desired_output = float(ui["goal"])
+                n_trials = int(ui["trials"])
+                test_duration_s = float(ui["test_duration_s"])
+                frequency_khz = int(ui["frequency_khz"])
+                if action == "start" and root is not None:
+                    monitor = RuntimeMonitor(root, desired_output=desired_output)
+            else:
+                log("GUI unavailable; falling back to console prompts.")
 
-    if action is None:
-        action = prompt_launch_action()
-        if action == "start":
-            desired_output = prompt_goal_power_output(default_goal)
-            n_trials = prompt_trial_count(args.iters)
-            frequency_khz = prompt_frequency_khz(default_frequency_khz)
+        if action is None:
+            action = prompt_launch_action()
+            if action == "start":
+                desired_output = prompt_goal_power_output(default_goal)
+                n_trials = prompt_trial_count(args.iters)
+                frequency_khz = prompt_frequency_khz(default_frequency_khz)
 
-    if action == "quit":
-        if startup_ser is not None:
-            startup_ser.close()
-        log("Exiting on user request.")
-        return
-    if action == "graph":
-        if startup_ser is not None:
-            startup_ser.close()
-        try:
-            run_graph_tool(args.power_csv, prefer_gui=(not args.no_gui))
-        except RuntimeError as e:
-            log(f"Graph tool error: {e}")
-        log("Graph tool closed.")
-        return
+        if action == "quit":
+            log("Exiting on user request.")
+            return
+        if action == "graph":
+            try:
+                run_graph_tool(args.power_csv, prefer_gui=(not args.no_gui))
+            except RuntimeError as e:
+                log(f"Graph tool error: {e}")
+            log("Graph tool closed; returning to main menu.")
+            continue
 
-    if not args.port:
-        raise SystemExit("--port is required for start and reset actions")
+        if not args.port:
+            raise SystemExit("--port is required for start and reset actions")
 
-    # Reuse the startup serial session when available so defaults and commands
-    # come from the same live connection.
-    if startup_ser is not None and startup_io is not None:
-        ser = startup_ser
-        io = startup_io
-        startup_ser = None
-        startup_io = None
-    else:
         log("Opening serial port")
         ser = serial.Serial(args.port, args.baud, timeout=0.1)
         io = SerialLineIO(
@@ -692,308 +1031,125 @@ def main():
             log_data_lines=args.log_data,
             data_log_every=args.log_data_every,
         )
-    try:
-        if action == "reset":
-            log("Resetting PID values to defaults")
-            reset_pid_defaults(io)
-            log("Defaults restored successfully.")
-            return
+        try:
+            if action == "reset":
+                log("Resetting PID values to defaults")
+                reset_pid_defaults(io)
+                log("Defaults restored successfully. Returning to main menu.")
+                continue
 
-        if desired_output is None:
-            desired_output = prompt_goal_power_output(default_goal)
-        log(f"Goal power output set to {desired_output:.4f}")
-        if n_trials is None:
-            n_trials = prompt_trial_count(args.iters)
-        log(f"Configured trials: {n_trials} (total laser runs: {n_trials * 5})")
-        if test_duration_s is None:
-            test_duration_s = float(args.test_duration_s)
-        log(f"Configured per-test duration: {test_duration_s:.2f}s")
-        if frequency_khz is None:
-            frequency_khz = int(default_frequency_khz)
-        log(f"Configured frequency: {frequency_khz} kHz")
-        if monitor is not None:
-            monitor.set_target(desired_output)
-            monitor.set_status("Sending startup program command")
-
-        configure_program(io, power_w=desired_output, frequency_khz=frequency_khz)
-        log(
-            "Program setup sent: "
-            f"power={int(round(desired_output)):04d}, "
-            f"frequency={int(frequency_khz):04d} "
-            "(other program fields preserved from GET_PROGRAM when available)"
-        )
-        if monitor is not None:
-            monitor.set_status("Program setup applied")
-
-        duration = 15.0
-        space = [
-            Real(0.0, args.kp_max, name="kp"),
-            Real(0.0, args.ki_max, name="ki"),
-            Real(0.0, args.kd_max, name="kd"),
-        ]
-
-        # Keep a trial-by-trial record for later review.
-        history = []
-        power_rows = []
-        trial_index = 0
-        baseline_score = None
-        best_score_seen = float("inf")
-        best_pid = None
-        last_applied = None
-        no_improve_count = 0
-        refine_mode = False
-        recovery_mode = False
-        recovery_exact_next = True
-        stagnation_axis = 0
-        stagnation_sign = 1.0
-        step_kp = float(args.max_step_kp)
-        step_ki = float(args.max_step_ki)
-        step_kd = float(args.max_step_kd)
-        min_step_kp = max(0.01, step_kp * 0.1)
-        min_step_ki = max(0.01, step_ki * 0.1)
-        min_step_kd = max(0.005, step_kd * 0.1)
-
-        def objective(x):
-            nonlocal trial_index, baseline_score, best_score_seen, best_pid, last_applied
-            nonlocal no_improve_count, refine_mode
-            nonlocal recovery_mode, recovery_exact_next
-            nonlocal stagnation_axis, stagnation_sign
-            nonlocal step_kp, step_ki, step_kd
-            kp, ki, kd = x
-            log(f"Trial {trial_index + 1}/{n_trials}")
-
-            best_improve_pct_so_far = 0.0
-            if baseline_score and baseline_score > 0 and best_score_seen < float("inf"):
-                best_improve_pct_so_far = 100.0 * (baseline_score - best_score_seen) / baseline_score
-
-            if best_pid is not None and best_improve_pct_so_far >= args.refine_activate_improve_pct:
-                bkp, bki, bkd = best_pid
-                kp_raw, ki_raw, kd_raw = kp, ki, kd
-                kp = float(np.clip(kp, bkp - args.refine_radius_kp, bkp + args.refine_radius_kp))
-                ki = float(np.clip(ki, bki - args.refine_radius_ki, bki + args.refine_radius_ki))
-                kd = float(np.clip(kd, bkd - args.refine_radius_kd, bkd + args.refine_radius_kd))
-                if not refine_mode:
-                    refine_mode = True
-                    log(
-                        "Refinement mode active around best PID: "
-                        f"radius=({args.refine_radius_kp:.3f},{args.refine_radius_ki:.3f},{args.refine_radius_kd:.3f})"
-                    )
-                if (kp, ki, kd) != (kp_raw, ki_raw, kd_raw):
-                    log(
-                        "Refine-bounded candidate -> "
-                        f"kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f} "
-                        f"(from {kp_raw:.4f}, {ki_raw:.4f}, {kd_raw:.4f})"
-                    )
-
-            if trial_index > 0 and last_applied is not None:
-                prev_kp, prev_ki, prev_kd = last_applied
-                kp_raw, ki_raw, kd_raw = kp, ki, kd
-                kp = float(np.clip(kp, prev_kp - step_kp, prev_kp + step_kp))
-                ki = float(np.clip(ki, prev_ki - step_ki, prev_ki + step_ki))
-                kd = float(np.clip(kd, prev_kd - step_kd, prev_kd + step_kd))
-                if (kp, ki, kd) != (kp_raw, ki_raw, kd_raw):
-                    log(
-                        "Step-limited candidate -> "
-                        f"kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f} "
-                        f"(from {kp_raw:.4f}, {ki_raw:.4f}, {kd_raw:.4f})"
-                    )
-
-            if best_pid is not None and (recovery_mode or no_improve_count >= 3):
-                if not recovery_mode:
-                    recovery_mode = True
-                    recovery_exact_next = True
-                    log("Stagnation detected: entering local recovery around best PID")
-
-                bkp, bki, bkd = best_pid
-                if recovery_exact_next:
-                    kp, ki, kd = float(bkp), float(bki), float(bkd)
-                    recovery_exact_next = False
-                    log(
-                        "Recovery probe -> exact best PID re-test: "
-                        f"kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}"
-                    )
-                else:
-                    kp, ki, kd = float(bkp), float(bki), float(bkd)
-                    delta_kp = max(min_step_kp, step_kp * 0.35)
-                    delta_ki = max(min_step_ki, step_ki * 0.35)
-                    delta_kd = max(min_step_kd, step_kd * 0.35)
-                    if stagnation_axis == 0:
-                        kp = float(np.clip(kp + (stagnation_sign * delta_kp), 0.0, args.kp_max))
-                        axis_name = "kp"
-                    elif stagnation_axis == 1:
-                        ki = float(np.clip(ki + (stagnation_sign * delta_ki), 0.0, args.ki_max))
-                        axis_name = "ki"
-                    else:
-                        kd = float(np.clip(kd + (stagnation_sign * delta_kd), 0.0, args.kd_max))
-                        axis_name = "kd"
-                    log(
-                        "Recovery probe -> best PID with small perturbation "
-                        f"on {axis_name}: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}"
-                    )
-                    stagnation_axis = (stagnation_axis + 1) % 3
-                    if stagnation_axis == 0:
-                        stagnation_sign *= -1.0
-
-            apply_pid_update = trial_index > 0
-            _, _, _, aborted, current_pid, per_test_powers, per_test_times, per_test_meta = run_trial(
-                io,
-                kp,
-                ki,
-                kd,
-                desired_output=desired_output,
-                apply_pid_update=apply_pid_update,
-                test_duration_s=test_duration_s,
-                startup_grace_s=args.startup_grace_s,
-                settled_window_samples=args.settled_window_samples,
-                duration=duration,
-                kp_max=args.kp_max,
-                ki_max=args.ki_max,
-                kd_max=args.kd_max,
-                monitor=monitor,
-                trial_index=trial_index + 1,
+            if desired_output is None:
+                desired_output = prompt_goal_power_output(default_goal)
+            log(f"Goal power output set to {desired_output:.4f}")
+            if n_trials is None:
+                n_trials = prompt_trial_count(args.iters)
+            log(
+                f"Configured Bayesian trials: {n_trials} "
+                "(candidate gathering warmup runs separately before BO starts)"
             )
-
-            used_kp, used_ki, used_kd = kp, ki, kd
-            if trial_index == 0:
-                if current_pid is not None:
-                    used_kp = float(current_pid["pw_kp"])
-                    used_ki = float(current_pid["pw_ki"])
-                    used_kd = float(current_pid["pw_kd"])
-                    log(
-                        "Stored initial laser PID values for baseline trial: "
-                        f"kp={used_kp:.4f}, ki={used_ki:.4f}, kd={used_kd:.4f}"
-                    )
-                    last_applied = (used_kp, used_ki, used_kd)
-                else:
-                    last_applied = None
-            else:
-                last_applied = (used_kp, used_ki, used_kd)
-
-            metrics = compute_trial_metrics(per_test_powers, per_test_meta, desired_output)
-            score = score_controller(
-                metrics,
-                w_start=args.w_start,
-                w_track=args.w_track,
-                w_dev=args.w_dev,
-                w_max=args.w_max,
-                w_repeat=args.w_repeat,
-                w_strict=args.w_strict,
-                w_osc=args.w_osc,
-                invalid_penalty=args.invalid_penalty,
-                aborted=aborted,
+            if test_duration_s is None:
+                test_duration_s = float(args.test_duration_s)
+            log(f"Configured per-test duration: {test_duration_s:.2f}s")
+            log(
+                f"Configured repeats: warmup={int(args.warmup_repeats)}, "
+                f"BO={int(args.bo_repeats)}"
             )
+            if frequency_khz is None:
+                frequency_khz = int(default_frequency_khz)
+            log(f"Configured frequency: {frequency_khz} kHz")
+            if monitor is not None:
+                monitor.set_target(desired_output)
+                monitor.set_phase("Phase: Gathering candidates")
+                monitor.set_status("Sending startup program command")
 
-            prev_best_score = best_score_seen
-            if baseline_score is None:
-                baseline_score = score
-            best_score_seen = min(best_score_seen, score)
+            configure_program(io, power_w=desired_output, frequency_khz=frequency_khz)
+            log(
+                "Program setup sent: "
+                f"power={int(round(desired_output)):04d}, "
+                f"frequency={int(frequency_khz):04d} "
+                "(other program fields preserved from GET_PROGRAM when available)"
+            )
+            if monitor is not None:
+                monitor.set_status("Program setup applied")
 
-            improved = score < prev_best_score
-            if improved:
-                best_pid = (used_kp, used_ki, used_kd)
-                no_improve_count = 0
-                recovery_mode = False
-                recovery_exact_next = True
-                step_kp = max(min_step_kp, step_kp * float(args.step_shrink_factor))
-                step_ki = max(min_step_ki, step_ki * float(args.step_shrink_factor))
-                step_kd = max(min_step_kd, step_kd * float(args.step_shrink_factor))
-            else:
-                no_improve_count += 1
-                if recovery_mode:
-                    step_kp = max(min_step_kp, step_kp * 0.95)
-                    step_ki = max(min_step_ki, step_ki * 0.95)
-                    step_kd = max(min_step_kd, step_kd * 0.95)
-                elif best_improve_pct_so_far < float(args.lock_growth_after_improve_pct):
-                    step_kp = min(float(args.max_step_kp), step_kp * float(args.step_growth_factor))
-                    step_ki = min(float(args.max_step_ki), step_ki * float(args.step_growth_factor))
-                    step_kd = min(float(args.max_step_kd), step_kd * float(args.step_growth_factor))
+            duration = 15.0
 
-            if baseline_score and baseline_score > 0:
-                improve_vs_base_pct = 100.0 * (baseline_score - score) / baseline_score
-                best_improve_vs_base_pct = 100.0 * (baseline_score - best_score_seen) / baseline_score
-            else:
-                improve_vs_base_pct = 0.0
-                best_improve_vs_base_pct = 0.0
+            # Keep a trial-by-trial record for later review.
+            history = []
+            power_rows = []
+            trial_index = 0
+            warmup_trial_count = 0
+            bo_trial_count = 0
+            baseline_score = None
+            best_score_seen = float("inf")
+            best_pid = None
+            last_applied = None
+            no_improve_count = 0
+            step_kp = float(args.max_step_kp)
+            step_ki = float(args.max_step_ki)
+            step_kd = float(args.max_step_kd)
+            min_step_kp = max(0.01, step_kp * 0.1)
+            min_step_ki = max(0.01, step_ki * 0.1)
+            min_step_kd = max(0.005, step_kd * 0.1)
+            axis_index = 0
+            axis_directions = [1.0, 1.0, 1.0]
+            safe_trial_points: list[tuple[float, float, float]] = []
+            good_trial_points: list[tuple[float, float, float]] = []
+            observed_points: list[tuple[float, float, float]] = []
+            observed_scores: list[float] = []
+            region_status = {
+                "ready": False,
+                "reason": "no safe candidates yet",
+                "unique_counts": (0, 0, 0),
+                "spans": (0.0, 0.0, 0.0),
+            }
 
-            history.append(
-                (
-                    used_kp,
-                    used_ki,
-                    used_kd,
-                    score,
-                    improve_vs_base_pct,
-                    best_improve_vs_base_pct,
-                    metrics["start_error"],
-                    metrics["track_error"],
-                    metrics["deviation"],
-                    metrics["max_error"],
-                    metrics["strict_bad_rate"],
-                    metrics["oscillation_rate"],
-                    metrics["invalid_ratio"],
-                    metrics["repeatability"],
-                    int(aborted),
+            def evaluate_candidate(
+                kp: float,
+                ki: float,
+                kd: float,
+                *,
+                mode: str,
+                used_axis: int | None = None,
+            ) -> float:
+                nonlocal trial_index, warmup_trial_count, bo_trial_count
+                nonlocal baseline_score, best_score_seen, best_pid, last_applied
+                nonlocal no_improve_count, step_kp, step_ki, step_kd, axis_index
+                is_bayes_mode = mode == "bayes"
+                display_phase_name = "BO" if is_bayes_mode else "Warmup"
+                display_phase_index = (bo_trial_count + 1) if is_bayes_mode else (warmup_trial_count + 1)
+                display_phase_total = n_trials if is_bayes_mode else None
+                phase_repeats = max(1, int(args.bo_repeats if is_bayes_mode else args.warmup_repeats))
+                log(
+                    f"{display_phase_name} trial {display_phase_index}"
+                    + (f"/{display_phase_total}" if display_phase_total is not None else "")
+                    + f" (overall {trial_index + 1})"
                 )
-            )
+                if monitor is not None:
+                    if is_bayes_mode:
+                        monitor.set_phase("Phase: Bayesian Optimisation")
+                    else:
+                        monitor.set_phase("Phase: Gathering candidates")
+                    progress = f"{display_phase_name} trial {display_phase_index}"
+                    if display_phase_total is not None:
+                        progress = f"{progress}/{display_phase_total}"
+                    monitor.set_progress(f"{progress} | configuring hardware | overall {trial_index + 1}")
 
-            best_test_idx = None
-            best_test_err = float("inf")
-            for i, (test_powers, test_meta) in enumerate(zip(per_test_powers, per_test_meta)):
-                if test_powers.size == 0:
-                    continue
-                if bool(test_meta.get("invalid", False)):
-                    continue
-                mae = float(np.mean(np.abs(test_powers - desired_output)))
-                if mae < best_test_err:
-                    best_test_err = mae
-                    best_test_idx = i
+                apply_pid_update = trial_index > 0
+                if not apply_pid_update:
+                    kp, ki, kd = 0.0, 0.0, 0.0
+                    log("Baseline trial -> using current laser PID values without changing gains")
+                elif mode == "bayes":
+                    log(f"Bayesian candidate -> kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
 
-            if best_test_idx is None:
-                for i, test_powers in enumerate(per_test_powers):
-                    if test_powers.size > 0:
-                        best_test_idx = i
-                        break
-
-            if best_test_idx is not None:
-                test_idx = best_test_idx + 1
-                test_powers = per_test_powers[best_test_idx]
-                test_times = per_test_times[best_test_idx]
-                test_meta = per_test_meta[best_test_idx]
-                if test_times.size == test_powers.size:
-                    time_vals = test_times.tolist()
-                else:
-                    time_vals = list(range(int(test_powers.size)))
-                for sample_idx, (t_s, power_val) in enumerate(zip(time_vals, test_powers.tolist()), start=1):
-                    power_rows.append(
-                        (
-                            trial_index + 1,
-                            test_idx,
-                            sample_idx,
-                            float(t_s),
-                            float(power_val),
-                            float(desired_output),
-                            float(used_kp),
-                            float(used_ki),
-                            float(used_kd),
-                            int(1 if bool(test_meta.get("invalid", False)) else 0),
-                            str(test_meta.get("reason", "")),
-                        )
-                    )
-
-            if (
-                args.retest_best_every > 0
-                and trial_index > 0
-                and best_pid is not None
-                and ((trial_index + 1) % args.retest_best_every == 0)
-            ):
-                bkp, bki, bkd = best_pid
-                log(f"Re-testing best PID at interval -> kp={bkp:.4f}, ki={bki:.4f}, kd={bkd:.4f}")
-                _, by, _, baborted, _, btests, btimes, bmeta = run_trial(
+                _, _, _, aborted, current_pid, per_test_powers, per_test_times, per_test_meta, cancelled_candidate, cancel_reason = run_trial(
                     io,
-                    bkp,
-                    bki,
-                    bkd,
+                    kp,
+                    ki,
+                    kd,
                     desired_output=desired_output,
-                    apply_pid_update=True,
+                    apply_pid_update=apply_pid_update,
+                    repeats=phase_repeats,
                     test_duration_s=test_duration_s,
                     startup_grace_s=args.startup_grace_s,
                     settled_window_samples=args.settled_window_samples,
@@ -1003,10 +1159,32 @@ def main():
                     kd_max=args.kd_max,
                     monitor=monitor,
                     trial_index=trial_index + 1,
+                    phase_name=display_phase_name,
+                    phase_trial_index=display_phase_index,
+                    phase_trial_total=display_phase_total,
+                    overall_trial_index=trial_index + 1,
+                    repeat_cancel_osc_threshold=args.repeat_cancel_osc_threshold,
                 )
-                bmetrics = compute_trial_metrics(btests, bmeta, desired_output)
-                bscore = score_controller(
-                    bmetrics,
+
+                used_kp, used_ki, used_kd = kp, ki, kd
+                if trial_index == 0:
+                    if current_pid is not None:
+                        used_kp = float(current_pid["pw_kp"])
+                        used_ki = float(current_pid["pw_ki"])
+                        used_kd = float(current_pid["pw_kd"])
+                        log(
+                            "Stored initial laser PID values for baseline trial: "
+                            f"kp={used_kp:.4f}, ki={used_ki:.4f}, kd={used_kd:.4f}"
+                        )
+                        last_applied = (used_kp, used_ki, used_kd)
+                    else:
+                        last_applied = None
+                else:
+                    last_applied = (used_kp, used_ki, used_kd)
+
+                metrics = compute_trial_metrics(per_test_powers, per_test_meta, desired_output)
+                score = score_controller(
+                    metrics,
                     w_start=args.w_start,
                     w_track=args.w_track,
                     w_dev=args.w_dev,
@@ -1015,117 +1193,370 @@ def main():
                     w_strict=args.w_strict,
                     w_osc=args.w_osc,
                     invalid_penalty=args.invalid_penalty,
-                    aborted=baborted,
+                    aborted=aborted,
                 )
+
+                prev_best_score = best_score_seen
+                if baseline_score is None:
+                    baseline_score = score
+                best_score_seen = min(best_score_seen, score)
+
+                improved = score < prev_best_score
+                if improved:
+                    best_pid = (used_kp, used_ki, used_kd)
+                    no_improve_count = 0
+                    step_kp = max(min_step_kp, step_kp * float(args.step_shrink_factor))
+                    step_ki = max(min_step_ki, step_ki * float(args.step_shrink_factor))
+                    step_kd = max(min_step_kd, step_kd * float(args.step_shrink_factor))
+                else:
+                    no_improve_count += 1
+                    if used_axis is not None:
+                        axis_directions[used_axis] *= -1.0
+                    if baseline_score is not None and baseline_score > 0:
+                        best_improve_pct_so_far = 100.0 * (baseline_score - best_score_seen) / baseline_score
+                    else:
+                        best_improve_pct_so_far = 0.0
+                    if best_improve_pct_so_far < float(args.lock_growth_after_improve_pct):
+                        step_kp = min(float(args.max_step_kp), step_kp * float(args.step_growth_factor))
+                        step_ki = min(float(args.max_step_ki), step_ki * float(args.step_growth_factor))
+                        step_kd = min(float(args.max_step_kd), step_kd * float(args.step_growth_factor))
+
+                if used_axis is not None:
+                    axis_index = (used_axis + 1) % 3
+
+                if baseline_score and baseline_score > 0:
+                    improve_vs_base_pct = 100.0 * (baseline_score - score) / baseline_score
+                    best_improve_vs_base_pct = 100.0 * (baseline_score - best_score_seen) / baseline_score
+                else:
+                    improve_vs_base_pct = 0.0
+                    best_improve_vs_base_pct = 0.0
+
+                if apply_pid_update:
+                    observed_points.append((used_kp, used_ki, used_kd))
+                    observed_scores.append(score)
+                    is_safe_candidate = candidate_is_safe(
+                        metrics,
+                        cancelled_candidate=cancelled_candidate,
+                        aborted=aborted,
+                        max_invalid_ratio=args.bayes_safe_invalid_ratio,
+                        max_oscillation_rate=args.bayes_safe_oscillation_rate,
+                    )
+                    if is_safe_candidate:
+                        safe_trial_points.append((used_kp, used_ki, used_kd))
+                    if candidate_is_good(
+                        metrics,
+                        score,
+                        cancelled_candidate=cancelled_candidate,
+                        aborted=aborted,
+                        baseline_score=baseline_score,
+                        max_invalid_ratio=args.bayes_safe_invalid_ratio,
+                        max_oscillation_rate=args.bayes_safe_oscillation_rate,
+                        max_score_factor=args.bayes_region_good_score_factor,
+                    ):
+                        good_trial_points.append((used_kp, used_ki, used_kd))
+                    region_status = assess_bayes_region(
+                        safe_trial_points,
+                        good_trial_points,
+                        min_safe_candidates=args.bayes_min_safe_trials,
+                        min_points_per_axis=args.bayes_region_min_points_per_axis,
+                        min_good_candidates=args.bayes_region_min_good_candidates,
+                        min_span_kp=args.bayes_region_min_span_kp,
+                        min_span_ki=args.bayes_region_min_span_ki,
+                        min_span_kd=args.bayes_region_min_span_kd,
+                    )
+                    log(
+                        "Candidate region status -> "
+                        f"ready={region_status['ready']}, "
+                        f"reason={region_status['reason']}, "
+                        f"safe={len(safe_trial_points)}, "
+                        f"good={len(good_trial_points)}, "
+                        f"unique={region_status['unique_counts']}, "
+                        f"spans=({region_status['spans'][0]:.4f},"
+                        f"{region_status['spans'][1]:.4f},"
+                        f"{region_status['spans'][2]:.4f})"
+                    )
+
+                history.append(
+                    (
+                        used_kp,
+                        used_ki,
+                        used_kd,
+                        score,
+                        improve_vs_base_pct,
+                        best_improve_vs_base_pct,
+                        metrics["start_error"],
+                        metrics["track_error"],
+                        metrics["deviation"],
+                        metrics["max_error"],
+                        metrics["strict_bad_rate"],
+                        metrics["oscillation_rate"],
+                        metrics["invalid_ratio"],
+                        metrics["repeatability"],
+                        int(cancelled_candidate),
+                        cancel_reason,
+                        int(aborted),
+                    )
+                )
+
+                for test_idx, (test_powers, test_times, test_meta) in enumerate(
+                    zip(per_test_powers, per_test_times, per_test_meta),
+                    start=1,
+                ):
+                    if test_powers.size == 0:
+                        continue
+                    if test_times.size == test_powers.size:
+                        time_vals = test_times.tolist()
+                    else:
+                        time_vals = list(range(int(test_powers.size)))
+                    for sample_idx, (t_s, power_val) in enumerate(zip(time_vals, test_powers.tolist()), start=1):
+                        power_rows.append(
+                            (
+                                trial_index + 1,
+                                test_idx,
+                                sample_idx,
+                                float(t_s),
+                                float(power_val),
+                                float(desired_output),
+                                float(used_kp),
+                                float(used_ki),
+                                float(used_kd),
+                                int(1 if bool(test_meta.get("invalid", False)) else 0),
+                                str(test_meta.get("reason", "")),
+                            )
+                        )
+
+                if (
+                    args.retest_best_every > 0
+                    and trial_index > 0
+                    and best_pid is not None
+                    and ((trial_index + 1) % args.retest_best_every == 0)
+                ):
+                    bkp, bki, bkd = best_pid
+                    log(f"Re-testing best PID at interval -> kp={bkp:.4f}, ki={bki:.4f}, kd={bkd:.4f}")
+                    _, by, _, baborted, _, btests, btimes, bmeta, _, _ = run_trial(
+                        io,
+                        bkp,
+                        bki,
+                        bkd,
+                        desired_output=desired_output,
+                        apply_pid_update=True,
+                        repeats=max(1, int(args.bo_repeats)),
+                        test_duration_s=test_duration_s,
+                        startup_grace_s=args.startup_grace_s,
+                        settled_window_samples=args.settled_window_samples,
+                        duration=duration,
+                        kp_max=args.kp_max,
+                        ki_max=args.ki_max,
+                        kd_max=args.kd_max,
+                        monitor=monitor,
+                        trial_index=trial_index + 1,
+                    )
+                    bmetrics = compute_trial_metrics(btests, bmeta, desired_output)
+                    bscore = score_controller(
+                        bmetrics,
+                        w_start=args.w_start,
+                        w_track=args.w_track,
+                        w_dev=args.w_dev,
+                        w_max=args.w_max,
+                        w_repeat=args.w_repeat,
+                        w_strict=args.w_strict,
+                        w_osc=args.w_osc,
+                        invalid_penalty=args.invalid_penalty,
+                        aborted=baborted,
+                    )
+                    log(
+                        f"Best re-test -> score={bscore:.2f}, "
+                        f"track_err={bmetrics['track_error']:.5f}, dev={bmetrics['deviation']:.5f}, "
+                        f"repeat={bmetrics['repeatability']:.5f}, aborted={baborted}"
+                    )
+                    _ = by
+                    _ = btimes
+
                 log(
-                    f"Best re-test -> score={bscore:.2f}, "
-                    f"track_err={bmetrics['track_error']:.5f}, dev={bmetrics['deviation']:.5f}, "
-                    f"repeat={bmetrics['repeatability']:.5f}, aborted={baborted}"
+                    f"Result -> score={score:.2f}, "
+                    f"improve={improve_vs_base_pct:.2f}%, "
+                    f"best_improve={best_improve_vs_base_pct:.2f}%, "
+                    f"no_improve={no_improve_count}, "
+                    f"step=({step_kp:.4f},{step_ki:.4f},{step_kd:.4f}), "
+                    f"start_err={metrics['start_error']:.5f}, "
+                    f"track_err={metrics['track_error']:.5f}, "
+                    f"dev={metrics['deviation']:.5f}, "
+                    f"max_err={metrics['max_error']:.5f}, "
+                    f"strict_bad={metrics['strict_bad_rate']:.5f}, "
+                    f"osc={metrics['oscillation_rate']:.5f}, "
+                    f"invalid={metrics['invalid_ratio']:.3f}, "
+                    f"repeat={metrics['repeatability']:.5f}, "
+                    f"cancelled={cancelled_candidate}, "
+                    f"aborted={aborted}"
                 )
-                _ = by
-                _ = btimes
+                if cancelled_candidate:
+                    log(f"Candidate repeats cancelled early: {cancel_reason}")
 
-            log(
-                f"Result -> score={score:.2f}, "
-                f"improve={improve_vs_base_pct:.2f}%, "
-                f"best_improve={best_improve_vs_base_pct:.2f}%, "
-                f"no_improve={no_improve_count}, "
-                f"step=({step_kp:.4f},{step_ki:.4f},{step_kd:.4f}), "
-                f"start_err={metrics['start_error']:.5f}, "
-                f"track_err={metrics['track_error']:.5f}, "
-                f"dev={metrics['deviation']:.5f}, "
-                f"max_err={metrics['max_error']:.5f}, "
-                f"strict_bad={metrics['strict_bad_rate']:.5f}, "
-                f"osc={metrics['oscillation_rate']:.5f}, "
-                f"invalid={metrics['invalid_ratio']:.3f}, "
-                f"repeat={metrics['repeatability']:.5f}, "
-                f"aborted={aborted}"
-            )
+                trial_index += 1
+                if is_bayes_mode:
+                    bo_trial_count += 1
+                else:
+                    warmup_trial_count += 1
+                if args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
+                    raise EarlyStopOptimization(
+                        f"No score improvement for {no_improve_count} trials (patience={args.early_stop_patience})"
+                    )
+                return score
 
-            trial_index += 1
-            if args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
-                raise EarlyStopOptimization(
-                    f"No score improvement for {no_improve_count} trials (patience={args.early_stop_patience})"
+            def run_coordinate_trial() -> float:
+                nonlocal axis_index
+                base_pid = best_pid if best_pid is not None else last_applied
+                used_axis = None
+                candidate_delta = 0.0
+                if trial_index > 0:
+                    if base_pid is None:
+                        base_pid = (0.0, 0.0, 0.0)
+                    (kp, ki, kd), used_axis, _, candidate_delta = propose_coordinate_candidate(
+                        base_pid,
+                        axis_index=axis_index,
+                        axis_direction=axis_directions[axis_index % 3],
+                        step_kp=step_kp,
+                        step_ki=step_ki,
+                        step_kd=step_kd,
+                        kp_max=args.kp_max,
+                        ki_max=args.ki_max,
+                        kd_max=args.kd_max,
+                    )
+                    log(
+                        "Coordinate candidate -> "
+                        f"base=({base_pid[0]:.4f},{base_pid[1]:.4f},{base_pid[2]:.4f}), "
+                        f"axis={AXIS_NAMES[used_axis]}, delta={candidate_delta:+.4f}, "
+                        f"candidate=({kp:.4f},{ki:.4f},{kd:.4f})"
+                    )
+                else:
+                    kp, ki, kd = 0.0, 0.0, 0.0
+
+                score = evaluate_candidate(kp, ki, kd, mode="coordinate", used_axis=used_axis)
+                if used_axis is not None:
+                    axis_index = (used_axis + 1) % 3
+                return score
+
+            log("Starting coordinate warmup")
+            if monitor is not None:
+                monitor.set_phase("Phase: Gathering candidates")
+            try:
+                warmup_target = min(n_trials, max(1, int(args.coordinate_warmup_trials)))
+                max_warmup_trials = max(warmup_target, int(args.coordinate_warmup_trials) * 3, 12)
+                while warmup_trial_count < max_warmup_trials and (
+                    warmup_trial_count < warmup_target or not bool(region_status["ready"])
+                ):
+                    run_coordinate_trial()
+
+                if bool(region_status["ready"]):
+                    no_improve_count = 0
+                    log(
+                        f"Starting Bayesian optimisation after {warmup_trial_count} warmup trials; "
+                        f"running {n_trials} BO trials"
+                    )
+                    if monitor is not None:
+                        monitor.set_phase("Phase: Bayesian Optimisation")
+                    bayes_space = build_bayes_search_space(
+                        safe_trial_points,
+                        kp_max=args.kp_max,
+                        ki_max=args.ki_max,
+                        kd_max=args.kd_max,
+                        pad_kp=step_kp,
+                        pad_ki=step_ki,
+                        pad_kd=step_kd,
+                    )
+                    seed_points, seed_scores = filter_seed_points_for_space(
+                        observed_points,
+                        observed_scores,
+                        bayes_space,
+                    )
+                    gp_minimize(
+                        lambda x: evaluate_candidate(float(x[0]), float(x[1]), float(x[2]), mode="bayes"),
+                        bayes_space,
+                        n_calls=n_trials,
+                        n_initial_points=min(4, max(1, n_trials)),
+                        acq_func="EI",
+                        random_state=42,
+                        x0=seed_points if seed_points else None,
+                        y0=seed_scores if seed_scores else None,
+                    )
+                else:
+                    log(
+                        "Bayesian optimisation skipped: "
+                        f"no viable region found after {warmup_trial_count} warmup trials "
+                        f"({region_status['reason']})"
+                    )
+                    if monitor is not None:
+                        monitor.set_phase("Phase: Gathering candidates")
+                        monitor.set_progress(
+                            f"Warmup stopped after {warmup_trial_count} trials | {region_status['reason']}"
+                        )
+            except EarlyStopOptimization as e:
+                log(f"Early stop: {e}")
+
+            if best_pid is not None:
+                best_kp, best_ki, best_kd = best_pid
+            elif last_applied is not None:
+                best_kp, best_ki, best_kd = last_applied
+            else:
+                best_kp, best_ki, best_kd = 0.0, 0.0, 0.0
+            log("Tuning complete")
+            if monitor is not None:
+                monitor.set_phase("Phase: Run complete")
+            log(f"BEST kp={best_kp:.6f}, ki={best_ki:.6f}, kd={best_kd:.6f}")
+            if best_score_seen < float("inf"):
+                log(f"Best score={best_score_seen:.3f}")
+
+            with open("tuning_history.csv", "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "kp",
+                        "ki",
+                        "kd",
+                        "score",
+                        "improve_vs_baseline_pct",
+                        "best_improve_vs_baseline_pct",
+                        "start_error",
+                        "track_error",
+                        "deviation",
+                        "max_error",
+                        "strict_bad_rate",
+                        "oscillation_rate",
+                        "invalid_ratio",
+                        "repeatability",
+                        "cancelled_repeats",
+                        "cancel_reason",
+                        "aborted",
+                    ]
                 )
-            return score
+                writer.writerows(history)
+            log("Saved tuning_history.csv")
 
-        log("Starting Bayesian Optimisation")
-        result = None
-        try:
-            result = gp_minimize(
-                objective,
-                space,
-                n_calls=n_trials,
-                n_initial_points=min(6, n_trials),
-                acq_func="EI",
-                random_state=42,
-            )
-        except EarlyStopOptimization as e:
-            log(f"Early stop: {e}")
-
-        if best_pid is not None:
-            best_kp, best_ki, best_kd = best_pid
-        elif result is not None:
-            best_kp, best_ki, best_kd = result.x
-        else:
-            best_kp, best_ki, best_kd = 0.0, 0.0, 0.0
-        log("Optimisation complete")
-        log(f"BEST kp={best_kp:.6f}, ki={best_ki:.6f}, kd={best_kd:.6f}")
-        if best_score_seen < float("inf"):
-            log(f"Best score={best_score_seen:.3f}")
-        elif result is not None:
-            log(f"Best score={result.fun:.3f}")
-
-        with open("tuning_history.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "kp",
-                    "ki",
-                    "kd",
-                    "score",
-                    "improve_vs_baseline_pct",
-                    "best_improve_vs_baseline_pct",
-                    "start_error",
-                    "track_error",
-                    "deviation",
-                    "max_error",
-                    "strict_bad_rate",
-                    "oscillation_rate",
-                    "invalid_ratio",
-                    "repeatability",
-                    "aborted",
-                ]
-            )
-            writer.writerows(history)
-        log("Saved tuning_history.csv")
-
-        with open("tuning_power_readings.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "trial_index",
-                    "test_index",
-                    "sample_index",
-                    "time_s",
-                    "current_power",
-                    "desired_output",
-                    "kp",
-                    "ki",
-                    "kd",
-                    "test_invalid",
-                    "test_note",
-                ]
-            )
-            writer.writerows(power_rows)
-        log("Saved tuning_power_readings.csv")
-        if monitor is not None:
-            monitor.mark_complete("Optimisation complete. Close the window to exit.")
-    finally:
-        ser.close()
-
-    if monitor is not None:
-        monitor.wait_until_closed()
+            with open("tuning_power_readings.csv", "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "trial_index",
+                        "test_index",
+                        "sample_index",
+                        "time_s",
+                        "current_power",
+                        "desired_output",
+                        "kp",
+                        "ki",
+                        "kd",
+                        "test_invalid",
+                        "test_note",
+                    ]
+                )
+                writer.writerows(power_rows)
+            log("Saved tuning_power_readings.csv")
+            default_goal = float(desired_output)
+            default_frequency_khz = int(frequency_khz)
+            if monitor is not None:
+                monitor.mark_complete("Optimisation complete. Returning to main menu.")
+        finally:
+            ser.close()
 
 
 if __name__ == "__main__":

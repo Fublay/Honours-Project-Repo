@@ -1,6 +1,7 @@
 """Startup GUI and power trace graphing helpers."""
 
 import csv
+from pathlib import Path
 import time
 
 import numpy as np
@@ -8,6 +9,8 @@ import numpy as np
 
 class RuntimeMonitor:
     """Simple live Tk monitor for current power and active PID values."""
+
+    DISPLAY_TIME_OFFSET_S = 0.3
 
     def __init__(self, root, *, desired_output: float):
         import tkinter as tk
@@ -31,10 +34,14 @@ class RuntimeMonitor:
         frame.pack(fill="both", expand=True)
 
         self.status_var = tk.StringVar(value="Preparing tuner...")
+        self.phase_var = tk.StringVar(value="Phase: Gathering candidates")
+        self.progress_var = tk.StringVar(value="Progress: waiting for first trial")
         self.power_var = tk.StringVar(value="Current power: --")
         self.pid_var = tk.StringVar(value="PID: --")
 
         tk.Label(frame, text="Live Power Output", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+        tk.Label(frame, textvariable=self.phase_var, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(4, 0))
+        tk.Label(frame, textvariable=self.progress_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
         tk.Label(frame, textvariable=self.status_var).pack(anchor="w", pady=(4, 0))
         tk.Label(frame, textvariable=self.power_var).pack(anchor="w", pady=(0, 10))
 
@@ -44,17 +51,18 @@ class RuntimeMonitor:
         footer = tk.Frame(frame, pady=8)
         footer.pack(fill="x")
         tk.Label(footer, textvariable=self.pid_var, anchor="w", justify="left").pack(side="left")
+        self.close_hint_var = tk.StringVar(value="Test window stays open until the run finishes.")
+        tk.Label(footer, textvariable=self.close_hint_var, anchor="e", justify="right").pack(side="right")
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self.process_events()
         self._draw_plot()
 
-    def _on_close(self):
-        self.closed = True
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+    def _on_close_requested(self):
+        if self.closed:
+            return
+        self.close_hint_var.set("Use the main menu Quit button to exit the application.")
+        self.process_events()
 
     def process_events(self):
         if self.closed:
@@ -75,18 +83,45 @@ class RuntimeMonitor:
         self.status_var.set(str(message))
         self.process_events()
 
+    def set_phase(self, phase: str):
+        if self.closed:
+            return
+        self.phase_var.set(str(phase))
+        self.process_events()
+
+    def set_progress(self, message: str):
+        if self.closed:
+            return
+        self.progress_var.set(str(message))
+        self.process_events()
+
     def set_pid_values(self, kp: float, ki: float, kd: float):
         if self.closed:
             return
         self.pid_var.set(f"Current PID values: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}")
         self.process_events()
 
-    def begin_test(self, *, trial_index: int, repeat_index: int, repeats: int):
+    def begin_test(
+        self,
+        *,
+        phase_name: str,
+        phase_trial_index: int,
+        phase_trial_total: int | None,
+        repeat_index: int,
+        repeats: int,
+        overall_trial_index: int | None = None,
+    ):
         if self.closed:
             return
         self._times = []
         self._powers = []
-        self.status_var.set(f"Trial {trial_index}: test {repeat_index}/{repeats} running")
+        if phase_trial_total is not None:
+            progress = f"{phase_name} trial {phase_trial_index}/{phase_trial_total} | test {repeat_index}/{repeats}"
+        else:
+            progress = f"{phase_name} trial {phase_trial_index} | test {repeat_index}/{repeats}"
+        if overall_trial_index is not None:
+            progress = f"{progress} | overall {overall_trial_index}"
+        self.progress_var.set(progress)
         self.power_var.set("Current power: --")
         self._draw_plot(force=True)
         self.process_events()
@@ -94,7 +129,11 @@ class RuntimeMonitor:
     def append_sample(self, time_s: float, power: float, *, status: str | None = None):
         if self.closed:
             return
-        self._times.append(float(time_s))
+        display_time = float(time_s) + self.DISPLAY_TIME_OFFSET_S
+        if not self._times:
+            self._times.append(0.0)
+            self._powers.append(0.0)
+        self._times.append(display_time)
         self._powers.append(float(power))
         self.power_var.set(f"Current power: {float(power):.4f}")
         if status:
@@ -166,7 +205,7 @@ class RuntimeMonitor:
             for t_val, power_val in zip(self._times, self._powers):
                 points.extend((x_px(t_val), y_px(power_val)))
             if len(points) >= 4:
-                canvas.create_line(*points, fill="#1f77b4", width=2, tags="plot")
+                canvas.create_line(*points, fill="#1f77b4", width=2, smooth=True, splinesteps=24, tags="plot")
 
             canvas.create_text(right, bottom + 18, text=f"{t_max:.2f} s", anchor="e", tags="plot")
             canvas.create_text(left - 8, bottom, text=f"{y_min:.1f}", anchor="e", tags="plot")
@@ -188,6 +227,7 @@ def prompt_launch_gui(
     default_trials: int,
     default_test_duration_s: float,
     default_frequency_khz: int,
+    root=None,
 ):
     """Show the startup GUI and return selected action + field values."""
     try:
@@ -202,19 +242,30 @@ def prompt_launch_gui(
         "trials": int(default_trials),
         "test_duration_s": float(default_test_duration_s),
         "frequency_khz": int(default_frequency_khz),
-        "root": None,
+        "root": root,
     }
 
-    try:
-        root = tk.Tk()
-    except Exception:
-        return None
+    if root is None:
+        try:
+            root = tk.Tk()
+        except Exception:
+            return None
+    else:
+        try:
+            root.deiconify()
+        except Exception:
+            pass
+
+    for child in root.winfo_children():
+        child.destroy()
 
     root.title("PID Tuner")
     root.resizable(False, False)
 
     frame = tk.Frame(root, padx=12, pady=12)
     frame.grid(row=0, column=0, sticky="nsew")
+    root.grid_columnconfigure(0, weight=1)
+    root.grid_rowconfigure(0, weight=1)
 
     tk.Label(frame, text="Goal Power Output").grid(row=0, column=0, sticky="w")
     goal_var = tk.StringVar(value=f"{float(default_goal):.4f}")
@@ -233,6 +284,9 @@ def prompt_launch_gui(
     tk.Label(frame, text="Test Duration (s)").grid(row=6, column=0, sticky="w")
     duration_var = tk.StringVar(value=f"{float(default_test_duration_s):.1f}")
     tk.Entry(frame, textvariable=duration_var, width=16).grid(row=7, column=0, sticky="w", pady=(2, 10))
+
+    status_var = tk.StringVar(value="Close the application with the Quit button.")
+    tk.Label(frame, textvariable=status_var, fg="#555555").grid(row=9, column=0, sticky="w", pady=(10, 0))
 
     
 
@@ -278,7 +332,8 @@ def prompt_launch_gui(
 
     def on_reset():
         result["action"] = "reset"
-        root.destroy()
+        result["root"] = root
+        root.quit()
 
     def on_quit():
         result["action"] = "quit"
@@ -286,7 +341,11 @@ def prompt_launch_gui(
 
     def on_graph():
         result["action"] = "graph"
-        root.destroy()
+        result["root"] = root
+        root.quit()
+
+    def on_window_close():
+        status_var.set("Use the Quit button to close the application.")
 
     btn_row = tk.Frame(frame)
     btn_row.grid(row=8, column=0, sticky="w")
@@ -295,7 +354,7 @@ def prompt_launch_gui(
     tk.Button(btn_row, text="Graph Power", width=11, command=on_graph).grid(row=0, column=2, padx=(0, 6))
     tk.Button(btn_row, text="Quit", width=8, command=on_quit).grid(row=0, column=3)
 
-    root.protocol("WM_DELETE_WINDOW", on_quit)
+    root.protocol("WM_DELETE_WINDOW", on_window_close)
     goal_entry.focus_set()
     root.mainloop()
 
@@ -316,13 +375,15 @@ def load_power_series(csv_path: str):
                 t_s = float(row["time_s"])
                 power = float(row["current_power"])
                 goal = float(row["desired_output"])
+                invalid = bool(int(row.get("test_invalid", "0")))
             except (ValueError, KeyError):
                 continue
             key = (trial, test)
-            bucket = series_map.setdefault(key, {"time_s": [], "power": [], "goal": goal})
+            bucket = series_map.setdefault(key, {"time_s": [], "power": [], "goal": goal, "invalid": False})
             bucket["time_s"].append(t_s)
             bucket["power"].append(power)
             bucket["goal"] = goal
+            bucket["invalid"] = bucket["invalid"] or invalid
 
     final = {}
     for key, payload in series_map.items():
@@ -330,8 +391,109 @@ def load_power_series(csv_path: str):
             "time_s": np.array(payload["time_s"], dtype=float),
             "power": np.array(payload["power"], dtype=float),
             "goal": float(payload["goal"]),
+            "invalid": bool(payload["invalid"]),
         }
     return final
+
+
+def compute_series_mae(payload: dict) -> float:
+    """Compute mean absolute error to the goal for one saved test series."""
+    power = np.asarray(payload["power"], dtype=float)
+    if power.size == 0:
+        return float("inf")
+    goal = float(payload["goal"])
+    return float(np.mean(np.abs(power - goal)))
+
+
+def find_best_single_test(series: dict):
+    """Return the best individual test key by MAE, preferring non-invalid tests."""
+    best_key = None
+    best_mae = float("inf")
+    for key, payload in sorted(series.items()):
+        if payload["invalid"]:
+            continue
+        mae = compute_series_mae(payload)
+        if mae < best_mae:
+            best_mae = mae
+            best_key = key
+    if best_key is not None:
+        return best_key
+
+    for key, payload in sorted(series.items()):
+        mae = compute_series_mae(payload)
+        if mae < best_mae:
+            best_mae = mae
+            best_key = key
+    return best_key
+
+
+def build_trial_average_series(series: dict):
+    """Build one averaged trace per trial, dropping the worst valid test as an outlier when possible."""
+    tests_by_trial = {}
+    for key, payload in series.items():
+        tests_by_trial.setdefault(key[0], []).append((key, payload))
+
+    averages = {}
+    for trial, entries in sorted(tests_by_trial.items()):
+        non_empty = [(key, payload) for key, payload in entries if np.asarray(payload["power"], dtype=float).size > 0]
+        if not non_empty:
+            continue
+
+        valid = [(key, payload) for key, payload in non_empty if not payload["invalid"]]
+        candidates = valid or non_empty
+        removed_key = None
+        if len(candidates) >= 3:
+            removed_key, _ = max(candidates, key=lambda item: compute_series_mae(item[1]))
+            candidates = [item for item in candidates if item[0] != removed_key]
+
+        if not candidates:
+            candidates = valid or non_empty
+
+        best_test_key, best_test_payload = min(candidates, key=lambda item: compute_series_mae(item[1]))
+        min_len = min(
+            min(len(np.asarray(payload["time_s"], dtype=float)), len(np.asarray(payload["power"], dtype=float)))
+            for _, payload in candidates
+        )
+        if min_len <= 0:
+            continue
+
+        time_stack = np.vstack([np.asarray(payload["time_s"], dtype=float)[:min_len] for _, payload in candidates])
+        power_stack = np.vstack([np.asarray(payload["power"], dtype=float)[:min_len] for _, payload in candidates])
+        averages[trial] = {
+            "time_s": np.mean(time_stack, axis=0),
+            "power": np.mean(power_stack, axis=0),
+            "goal": float(best_test_payload["goal"]),
+            "source_tests": [key[1] for key, _ in candidates],
+            "removed_test": None if removed_key is None else removed_key[1],
+            "best_test_key": best_test_key,
+        }
+
+    return averages
+
+
+def load_best_trial_index(history_csv_path: str):
+    """Return the 1-based trial index with the lowest score, if available."""
+    best_trial = None
+    best_score = None
+    with open(history_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row_index, row in enumerate(reader, start=1):
+            try:
+                score = float(row["score"])
+            except (ValueError, KeyError):
+                continue
+            if best_score is None or score < best_score:
+                best_score = score
+                best_trial = row_index
+    return best_trial
+
+
+def infer_history_csv_path(power_csv_path: str) -> str:
+    """Infer the sibling tuning history CSV path from the power readings CSV path."""
+    power_path = Path(power_csv_path)
+    if power_path.name == "tuning_power_readings.csv":
+        return str(power_path.with_name("tuning_history.csv"))
+    return str(power_path.with_name(f"{power_path.stem}_history.csv"))
 
 
 def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tuple[int, int] | None = None):
@@ -372,40 +534,52 @@ def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tupl
 
 
 def plot_power_tests_interactive(csv_path: str):
-    """Open interactive graph window with checkbox-based test visibility control."""
+    """Open graph window showing only the initial and best trial traces."""
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import Button, CheckButtons
 
     series = load_power_series(csv_path)
     if not series:
         raise RuntimeError(f"No valid readings found in {csv_path}")
 
-    keys = sorted(series.keys())
+    best_trial_index = None
+    history_csv_path = infer_history_csv_path(csv_path)
+    try:
+        best_trial_index = load_best_trial_index(history_csv_path)
+    except FileNotFoundError:
+        best_trial_index = None
+    trial_averages = build_trial_average_series(series)
+    if not trial_averages:
+        raise RuntimeError(f"No valid trial averages found in {csv_path}")
 
-    fig = plt.figure(figsize=(12, 6))
-    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.4, 4.6])
-    ax_checks = fig.add_subplot(gs[0, 0])
-    ax_plot = fig.add_subplot(gs[0, 1])
+    initial_trial_index = min(trial_averages.keys())
+    selected_trials = [initial_trial_index]
+    if best_trial_index is not None and best_trial_index in trial_averages and best_trial_index != initial_trial_index:
+        selected_trials.append(best_trial_index)
 
-    lines_by_label = {}
-    labels = []
+    fig, ax_plot = plt.subplots(figsize=(12, 6))
+
     goals_plotted = set()
-    for key in keys:
-        trial, test = key
-        label = f"T{trial}-Test{test}"
-        payload = series[key]
-        line, = ax_plot.plot(payload["time_s"], payload["power"], label=label, visible=False)
-        lines_by_label[label] = line
-        labels.append(label)
+    for trial in selected_trials:
+        payload = trial_averages[trial]
+        removed_test = payload["removed_test"]
+        if trial == initial_trial_index:
+            label = "Initial trial"
+        else:
+            label = "Best trial"
+        if removed_test is not None:
+            label = f"{label} (excluding Test {removed_test})"
+        if trial == best_trial_index and trial == initial_trial_index:
+            label = "Initial / Best trial"
+        ax_plot.plot(
+            payload["time_s"],
+            payload["power"],
+            label=label,
+            linewidth=2.8,
+        )
         goal_val = float(payload["goal"])
         if goal_val not in goals_plotted:
             ax_plot.axhline(goal_val, linestyle="--", linewidth=1.0, alpha=0.5, label=f"Goal {goal_val:.2f}")
             goals_plotted.add(goal_val)
-
-    check = CheckButtons(ax_checks, labels, [False] * len(labels))
-
-    def visible_lines():
-        return [line for line in lines_by_label.values() if line.get_visible()]
 
     def apply_default_view():
         ax_plot.relim()
@@ -415,62 +589,10 @@ def plot_power_tests_interactive(csv_path: str):
             y_top = 1.0
         ax_plot.set_ylim(bottom=0.0, top=y_top)
 
-    def apply_zoomed_view():
-        candidates = visible_lines()
-        if not candidates:
-            candidates = list(lines_by_label.values())
-        if not candidates:
-            return
-
-        ymins = []
-        ymaxs = []
-        for line in candidates:
-            y = np.asarray(line.get_ydata(), dtype=float)
-            if y.size == 0:
-                continue
-            ymins.append(float(np.min(y)))
-            ymaxs.append(float(np.max(y)))
-        if not ymins:
-            return
-
-        y_min = min(ymins)
-        y_max = max(ymaxs)
-        span = max(y_max - y_min, 1e-6)
-        pad = max(0.5, span * 0.08)
-        ax_plot.set_ylim(y_min - pad, y_max + pad)
-
-    def on_clicked(label):
-        line = lines_by_label[label]
-        line.set_visible(not line.get_visible())
-        ax_plot.legend(loc="best")
-        fig.canvas.draw_idle()
-
-    check.on_clicked(on_clicked)
-
-    ax_all_on = fig.add_axes([0.08, 0.08, 0.10, 0.06])
-    ax_all_off = fig.add_axes([0.19, 0.08, 0.10, 0.06])
-    ax_default_view = fig.add_axes([0.30, 0.08, 0.12, 0.06])
-    ax_zoom_view = fig.add_axes([0.43, 0.08, 0.12, 0.06])
-    btn_all_on = Button(ax_all_on, "All On")
-    btn_all_off = Button(ax_all_off, "All Off")
-    btn_default_view = Button(ax_default_view, "Default View")
-    btn_zoom_view = Button(ax_zoom_view, "Zoomed View")
-
-    def set_all(target_visible: bool):
-        statuses = list(check.get_status())
-        for idx, is_on in enumerate(statuses):
-            if bool(is_on) != bool(target_visible):
-                check.set_active(idx)
-        ax_plot.legend(loc="best")
-        fig.canvas.draw_idle()
-
-    btn_all_on.on_clicked(lambda _evt: set_all(True))
-    btn_all_off.on_clicked(lambda _evt: set_all(False))
-    btn_default_view.on_clicked(lambda _evt: (apply_default_view(), fig.canvas.draw_idle()))
-    btn_zoom_view.on_clicked(lambda _evt: (apply_zoomed_view(), fig.canvas.draw_idle()))
-
-    ax_checks.set_title("Select Tests")
-    ax_plot.set_title("Power Readings")
+    title = "Power Readings: Initial vs Best Trial"
+    if len(selected_trials) == 1:
+        title = "Power Readings: Initial Trial"
+    ax_plot.set_title(title)
     ax_plot.set_xlabel("Time (s)")
     ax_plot.set_ylabel("Current Power")
     apply_default_view()
