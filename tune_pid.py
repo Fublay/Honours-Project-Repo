@@ -862,14 +862,7 @@ def format_readiness_status(
 
     tail = f"Blocked by: {region_status['reason']}"
     if bool(region_status.get("ready")):
-        tail = "Region ready for BO."
-        if (
-            warmup_trials_done is not None
-            and warmup_trials_target is not None
-            and warmup_trials_done < warmup_trials_target
-        ):
-            remaining = warmup_trials_target - warmup_trials_done
-            tail = f"Region ready. Waiting for {remaining} more warmup trial(s) before BO starts."
+        tail = "Region ready. Bayesian optimisation will start now."
 
     return (
         "BO readiness:\n"
@@ -1484,6 +1477,10 @@ def main():
                                 warmup_trials_target=warmup_target,
                             )
                         )
+                        if bool(region_status.get("ready")):
+                            monitor.set_phase("Phase: Bayesian Optimisation")
+                            monitor.set_progress("Bayesian optimisation ready | preparing search space")
+                            monitor.set_warmup_change("Warmup change: complete")
 
                 history.append(
                     (
@@ -1670,9 +1667,7 @@ def main():
             try:
                 warmup_target = max(1, int(args.coordinate_warmup_trials))
                 max_warmup_trials = max(warmup_target, int(args.coordinate_warmup_trials) * 3, 12)
-                while warmup_trial_count < max_warmup_trials and (
-                    warmup_trial_count < warmup_target or not bool(region_status["ready"])
-                ):
+                while warmup_trial_count < max_warmup_trials and not bool(region_status["ready"]):
                     run_coordinate_trial()
 
                 if bool(region_status["ready"]):
