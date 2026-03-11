@@ -187,6 +187,7 @@ def run_trial(
     phase_trial_total: int | None = None,
     overall_trial_index: int | None = None,
     repeat_cancel_osc_threshold: float = 0.35,
+    repeat_cancel_score_regression_pct: float = 8.0,
 ):
     """Run one PID candidate through repeated laser tests and collect telemetry.
 
@@ -306,22 +307,23 @@ def run_trial(
                 "strict_bad_rate": 1.0,
                 "oscillation_rate": 1.0,
                 "stopped_early": False,
+                "start_skewed": False,
+                "start_skew_error": 0.0,
             }
             recent_within_5pct = []
             strict_bad_count = 0
             strict_total = 0
-            prev_sign = 0
-            sign_flips = 0
-            sign_total = 0
+            settled_errors: list[float] = []
             first_seen = False
 
             base = max(abs(desired_output), 1e-6)
             limit_30 = 0.30 * base
             limit_5 = 0.05 * base
             limit_1 = 0.01 * base
+            osc_deadband = 0.03 * base
 
             def on_sample(t_val, mapped) -> bool:
-                nonlocal strict_bad_count, strict_total, prev_sign, sign_flips, sign_total, first_seen
+                nonlocal strict_bad_count, strict_total, first_seen
                 y_val = float(mapped["process_value"])
                 if monitor is not None:
                     monitor.append_sample(t_val, y_val, status=str(mapped.get("status", "RUNNING")))
@@ -340,17 +342,13 @@ def run_trial(
                         f"allowed=[{low_limit:.4f}, {high_limit:.4f}]"
                     )
                     if first_err > limit_30:
-                        test_meta["invalid"] = True
+                        test_meta["start_skewed"] = True
+                        test_meta["start_skew_error"] = float(first_err)
                         test_meta["reason"] = (
-                            f"first reading out of +/-30% "
+                            f"start skewed beyond +/-30% "
                             f"(initial={first_power:.4f}, target={desired_output:.4f})"
                         )
-                        try:
-                            io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
-                            test_meta["stopped_early"] = True
-                        except Exception as stop_err:
-                            log(f"Warning: failed to send immediate STOP on invalid test: {stop_err}")
-                        return True
+                        log(f"Test {rep + 1}/{repeats} note: {test_meta['reason']}")
 
                 if t_val < startup_grace_s:
                     return False
@@ -382,13 +380,7 @@ def run_trial(
                     if abs_err > limit_1:
                         strict_bad_count += 1
 
-                    sign = 1 if err > 0 else (-1 if err < 0 else 0)
-                    if prev_sign != 0 and sign != 0:
-                        sign_total += 1
-                        if sign != prev_sign:
-                            sign_flips += 1
-                    if sign != 0:
-                        prev_sign = sign
+                    settled_errors.append(float(err))
 
                 return False
 
@@ -416,10 +408,20 @@ def run_trial(
             else:
                 test_meta["strict_bad_rate"] = 1.0
 
-            if sign_total > 0:
-                test_meta["oscillation_rate"] = sign_flips / sign_total
+            significant_error_signs = []
+            for settled_err in settled_errors:
+                if abs(settled_err) < osc_deadband:
+                    continue
+                significant_error_signs.append(1 if settled_err > 0 else -1)
+            if len(significant_error_signs) >= 2:
+                sign_flips = sum(
+                    1
+                    for prev_sign, curr_sign in zip(significant_error_signs, significant_error_signs[1:])
+                    if prev_sign != curr_sign
+                )
+                test_meta["oscillation_rate"] = sign_flips / float(len(significant_error_signs) - 1)
             else:
-                test_meta["oscillation_rate"] = 1.0 if test_meta["settled"] else 0.0
+                test_meta["oscillation_rate"] = 0.0 if test_meta["settled"] else 1.0
 
             if not ry and not test_meta["invalid"]:
                 test_meta["invalid"] = True
@@ -449,18 +451,21 @@ def run_trial(
             elif test_meta["reason"]:
                 log(f"Test {rep + 1}/{repeats} note: {test_meta['reason']}")
 
-            if rep >= 1:
+            if rep >= 2:
                 prev_repeat_score = repeat_scores[-2]
+                score_regression_pct = 0.0
+                if prev_repeat_score > 1e-9:
+                    score_regression_pct = 100.0 * (repeat_score - prev_repeat_score) / prev_repeat_score
                 if test_meta["oscillation_rate"] >= repeat_cancel_osc_threshold:
                     cancelled_candidate = True
                     cancel_reason = (
                         f"repeat {rep + 1} oscillation too high "
                         f"({test_meta['oscillation_rate']:.3f} >= {repeat_cancel_osc_threshold:.3f})"
                     )
-                elif repeat_score > prev_repeat_score:
+                elif score_regression_pct >= float(repeat_cancel_score_regression_pct):
                     cancelled_candidate = True
                     cancel_reason = (
-                        f"repeat {rep + 1} score regressed "
+                        f"repeat {rep + 1} score regressed by {score_regression_pct:.1f}% "
                         f"({repeat_score:.3f} > {prev_repeat_score:.3f})"
                     )
 
@@ -504,6 +509,22 @@ def run_trial(
                 monitor.set_progress(f"Trial {trial_index} | shutter closed, standby set")
 
     aborted = any(s == "ABORT" for s in status_vals)
+    start_skew_count = sum(1 for meta in per_test_meta if bool(meta.get("start_skewed", False)))
+    start_skew_threshold = max(2, (len(per_test_meta) // 2) + 1) if per_test_meta else 2
+    if start_skew_count >= start_skew_threshold:
+        summary_reason = (
+            f"start skew exceeded +/-30% in {start_skew_count}/{len(per_test_meta)} repeats"
+        )
+        for meta in per_test_meta:
+            if bool(meta.get("start_skewed", False)) and not bool(meta.get("invalid", False)):
+                meta["invalid"] = True
+                meta["reason"] = summary_reason
+        if repeat_scores:
+            repeat_scores = [
+                999.0 if bool(meta.get("start_skewed", False)) else score
+                for meta, score in zip(per_test_meta, repeat_scores)
+            ]
+        log(f"Candidate start-skew rule triggered: {summary_reason}")
     if aborted:
         log("Warning: Trial aborted due to safety condition")
     if cancelled_candidate:
@@ -821,6 +842,121 @@ def filter_seed_points_for_space(
     return filtered_points, filtered_scores
 
 
+def format_readiness_status(
+    *,
+    region_status: dict,
+    safe_count: int,
+    safe_target: int,
+    good_count: int,
+    good_target: int,
+    unique_counts: tuple[int, int, int],
+    per_axis_target: int,
+    spans: tuple[float, float, float],
+    span_targets: tuple[float, float, float],
+    warmup_trials_done: int | None = None,
+    warmup_trials_target: int | None = None,
+) -> str:
+    """Build a short GUI checklist for BO readiness during warmup."""
+    def mark(done: bool) -> str:
+        return "[x]" if done else "[ ]"
+
+    tail = f"Blocked by: {region_status['reason']}"
+    if bool(region_status.get("ready")):
+        tail = "Region ready for BO."
+        if (
+            warmup_trials_done is not None
+            and warmup_trials_target is not None
+            and warmup_trials_done < warmup_trials_target
+        ):
+            remaining = warmup_trials_target - warmup_trials_done
+            tail = f"Region ready. Waiting for {remaining} more warmup trial(s) before BO starts."
+
+    return (
+        "BO readiness:\n"
+        f"{mark(safe_count >= safe_target)} Safe candidates: {safe_count}/{safe_target}\n"
+        f"{mark(good_count >= good_target)} Good candidates: {good_count}/{good_target}\n"
+        f"{mark(unique_counts[0] >= per_axis_target)} Kp coverage: {unique_counts[0]}/{per_axis_target} | "
+        f"span {spans[0]:.3f}/{span_targets[0]:.3f}\n"
+        f"{mark(unique_counts[1] >= per_axis_target)} Ki coverage: {unique_counts[1]}/{per_axis_target} | "
+        f"span {spans[1]:.3f}/{span_targets[1]:.3f}\n"
+        f"{mark(unique_counts[2] >= per_axis_target)} Kd coverage: {unique_counts[2]}/{per_axis_target} | "
+        f"span {spans[2]:.3f}/{span_targets[2]:.3f}\n"
+        f"{tail}"
+    )
+
+
+def format_warmup_change_message(
+    base_pid: tuple[float, float, float] | None,
+    candidate_pid: tuple[float, float, float] | None,
+    used_axis: int | None,
+    candidate_delta: float,
+) -> str:
+    """Describe the current warmup move for the monitor."""
+    if candidate_pid is None:
+        return "Warmup change: waiting for first candidate"
+    if base_pid is None or used_axis is None:
+        return "Warmup change: baseline trial using current hardware PID (no warmup delta)"
+    return (
+        "Warmup change: "
+        f"base=({base_pid[0]:.4f}, {base_pid[1]:.4f}, {base_pid[2]:.4f}) -> "
+        f"{AXIS_NAMES[used_axis]} {candidate_delta:+.4f} -> "
+        f"candidate=({candidate_pid[0]:.4f}, {candidate_pid[1]:.4f}, {candidate_pid[2]:.4f})"
+    )
+
+
+def format_previous_warmup_result_message(
+    *,
+    score: float,
+    metrics: dict,
+    per_test_meta: list[dict],
+    cancelled_candidate: bool,
+    cancel_reason: str,
+    aborted: bool,
+    baseline_score: float | None,
+    safe_invalid_ratio: float,
+    safe_oscillation_rate: float,
+    good_score_factor: float,
+) -> str:
+    """Summarise whether the last warmup candidate passed and why it failed if not."""
+    reasons: list[str] = []
+
+    if cancelled_candidate:
+        reasons.append(cancel_reason or "remaining repeats cancelled")
+    if aborted:
+        reasons.append("trial aborted by safety condition")
+
+    per_repeat_reasons = []
+    for meta in per_test_meta:
+        reason = str(meta.get("reason", "")).strip()
+        if reason:
+            per_repeat_reasons.append(reason)
+    primary_repeat_reason = list(dict.fromkeys(per_repeat_reasons))[0] if per_repeat_reasons else ""
+
+    invalid_ratio = float(metrics.get("invalid_ratio", 0.0))
+    if invalid_ratio > float(safe_invalid_ratio):
+        detail = f"invalid ratio {invalid_ratio:.2f} > {float(safe_invalid_ratio):.2f}"
+        if primary_repeat_reason:
+            detail = f"{detail} ({primary_repeat_reason})"
+        reasons.append(detail)
+
+    oscillation_rate = float(metrics.get("oscillation_rate", 0.0))
+    if oscillation_rate > float(safe_oscillation_rate):
+        reasons.append(f"oscillation {oscillation_rate:.2f} > {float(safe_oscillation_rate):.2f}")
+
+    if baseline_score is not None and baseline_score > 0:
+        good_limit = float(baseline_score) * float(good_score_factor)
+        if score > good_limit:
+            reasons.append(f"score {score:.2f} > good threshold {good_limit:.2f}")
+
+    if reasons:
+        return "Previous warmup result: failed - " + "; ".join(reasons)
+
+    return (
+        "Previous warmup result: passed - "
+        f"score={score:.2f}, invalid={invalid_ratio:.2f}, osc={oscillation_rate:.2f}"
+    )
+
+
 def main():
     """Parse inputs, run selected action, and manage full tuning workflow."""
     import argparse
@@ -908,14 +1044,20 @@ def main():
     ap.add_argument(
         "--bayes-safe-oscillation-rate",
         type=float,
-        default=0.20,
+        default=0.30,
         help="Maximum oscillation rate a warmup trial can have and still count as safe for Bayesian startup",
     )
     ap.add_argument(
         "--repeat-cancel-osc-threshold",
         type=float,
-        default=0.35,
+        default=0.80,
         help="Cancel remaining repeats for a PID candidate when oscillation rate meets or exceeds this value",
+    )
+    ap.add_argument(
+        "--repeat-cancel-score-regression-pct",
+        type=float,
+        default=8.0,
+        help="Cancel remaining repeats only when the repeat score regresses by at least this percentage",
     )
     ap.add_argument(
         "--lock-growth-after-improve-pct",
@@ -1103,6 +1245,30 @@ def main():
                 "unique_counts": (0, 0, 0),
                 "spans": (0.0, 0.0, 0.0),
             }
+            if monitor is not None:
+                warmup_target = max(1, int(args.coordinate_warmup_trials))
+                monitor.set_warmup_counter(f"Warmup counter: 0/{warmup_target} completed")
+                monitor.set_warmup_change("Warmup change: baseline trial using current hardware PID (no warmup delta)")
+                monitor.set_previous_warmup_result("Previous warmup result: none yet")
+                monitor.set_readiness(
+                    format_readiness_status(
+                        region_status=region_status,
+                        safe_count=0,
+                        safe_target=int(args.bayes_min_safe_trials),
+                        good_count=0,
+                        good_target=int(args.bayes_region_min_good_candidates),
+                        unique_counts=(0, 0, 0),
+                        per_axis_target=int(args.bayes_region_min_points_per_axis),
+                        spans=(0.0, 0.0, 0.0),
+                        span_targets=(
+                            float(args.bayes_region_min_span_kp),
+                            float(args.bayes_region_min_span_ki),
+                            float(args.bayes_region_min_span_kd),
+                        ),
+                        warmup_trials_done=0,
+                        warmup_trials_target=warmup_target,
+                    )
+                )
 
             def evaluate_candidate(
                 kp: float,
@@ -1128,6 +1294,7 @@ def main():
                 if monitor is not None:
                     if is_bayes_mode:
                         monitor.set_phase("Phase: Bayesian Optimisation")
+                        monitor.set_warmup_change("Warmup change: Bayesian search active")
                     else:
                         monitor.set_phase("Phase: Gathering candidates")
                     progress = f"{display_phase_name} trial {display_phase_index}"
@@ -1164,6 +1331,7 @@ def main():
                     phase_trial_total=display_phase_total,
                     overall_trial_index=trial_index + 1,
                     repeat_cancel_osc_threshold=args.repeat_cancel_osc_threshold,
+                    repeat_cancel_score_regression_pct=args.repeat_cancel_score_regression_pct,
                 )
 
                 used_kp, used_ki, used_kd = kp, ki, kd
@@ -1275,6 +1443,47 @@ def main():
                         f"{region_status['spans'][1]:.4f},"
                         f"{region_status['spans'][2]:.4f})"
                     )
+                    if monitor is not None:
+                        warmup_done = warmup_trial_count + 1
+                        warmup_target = max(1, int(args.coordinate_warmup_trials))
+                        remaining = max(0, warmup_target - warmup_done)
+                        monitor.set_warmup_counter(
+                            f"Warmup counter: {warmup_done}/{warmup_target} completed | {remaining} remaining"
+                        )
+                        if not is_bayes_mode:
+                            monitor.set_previous_warmup_result(
+                                format_previous_warmup_result_message(
+                                    score=score,
+                                    metrics=metrics,
+                                    per_test_meta=per_test_meta,
+                                    cancelled_candidate=cancelled_candidate,
+                                    cancel_reason=cancel_reason,
+                                    aborted=aborted,
+                                    baseline_score=baseline_score,
+                                    safe_invalid_ratio=args.bayes_safe_invalid_ratio,
+                                    safe_oscillation_rate=args.bayes_safe_oscillation_rate,
+                                    good_score_factor=args.bayes_region_good_score_factor,
+                                )
+                            )
+                        monitor.set_readiness(
+                            format_readiness_status(
+                                region_status=region_status,
+                                safe_count=len(safe_trial_points),
+                                safe_target=int(args.bayes_min_safe_trials),
+                                good_count=len(good_trial_points),
+                                good_target=int(args.bayes_region_min_good_candidates),
+                                unique_counts=tuple(region_status["unique_counts"]),
+                                per_axis_target=int(args.bayes_region_min_points_per_axis),
+                                spans=tuple(region_status["spans"]),
+                                span_targets=(
+                                    float(args.bayes_region_min_span_kp),
+                                    float(args.bayes_region_min_span_ki),
+                                    float(args.bayes_region_min_span_kd),
+                                ),
+                                warmup_trials_done=warmup_done,
+                                warmup_trials_target=warmup_target,
+                            )
+                        )
 
                 history.append(
                     (
@@ -1350,6 +1559,12 @@ def main():
                         kd_max=args.kd_max,
                         monitor=monitor,
                         trial_index=trial_index + 1,
+                        phase_name="BO Retest",
+                        phase_trial_index=bo_trial_count if bo_trial_count > 0 else 1,
+                        phase_trial_total=n_trials,
+                        overall_trial_index=trial_index + 1,
+                        repeat_cancel_osc_threshold=args.repeat_cancel_osc_threshold,
+                        repeat_cancel_score_regression_pct=args.repeat_cancel_score_regression_pct,
                     )
                     bmetrics = compute_trial_metrics(btests, bmeta, desired_output)
                     bscore = score_controller(
@@ -1428,8 +1643,21 @@ def main():
                         f"axis={AXIS_NAMES[used_axis]}, delta={candidate_delta:+.4f}, "
                         f"candidate=({kp:.4f},{ki:.4f},{kd:.4f})"
                     )
+                    if monitor is not None:
+                        monitor.set_warmup_change(
+                            format_warmup_change_message(
+                                base_pid,
+                                (kp, ki, kd),
+                                used_axis,
+                                candidate_delta,
+                            )
+                        )
                 else:
                     kp, ki, kd = 0.0, 0.0, 0.0
+                    if monitor is not None:
+                        monitor.set_warmup_change(
+                            format_warmup_change_message(None, (kp, ki, kd), None, 0.0)
+                        )
 
                 score = evaluate_candidate(kp, ki, kd, mode="coordinate", used_axis=used_axis)
                 if used_axis is not None:
@@ -1440,7 +1668,7 @@ def main():
             if monitor is not None:
                 monitor.set_phase("Phase: Gathering candidates")
             try:
-                warmup_target = min(n_trials, max(1, int(args.coordinate_warmup_trials)))
+                warmup_target = max(1, int(args.coordinate_warmup_trials))
                 max_warmup_trials = max(warmup_target, int(args.coordinate_warmup_trials) * 3, 12)
                 while warmup_trial_count < max_warmup_trials and (
                     warmup_trial_count < warmup_target or not bool(region_status["ready"])
@@ -1455,6 +1683,8 @@ def main():
                     )
                     if monitor is not None:
                         monitor.set_phase("Phase: Bayesian Optimisation")
+                        monitor.set_warmup_counter("")
+                        monitor.set_readiness("BO readiness:\n[x] Ready. Bayesian optimisation started.")
                     bayes_space = build_bayes_search_space(
                         safe_trial_points,
                         kp_max=args.kp_max,
@@ -1489,6 +1719,26 @@ def main():
                         monitor.set_phase("Phase: Gathering candidates")
                         monitor.set_progress(
                             f"Warmup stopped after {warmup_trial_count} trials | {region_status['reason']}"
+                        )
+                        monitor.set_warmup_counter("")
+                        monitor.set_readiness(
+                            format_readiness_status(
+                                region_status=region_status,
+                                safe_count=len(safe_trial_points),
+                                safe_target=int(args.bayes_min_safe_trials),
+                                good_count=len(good_trial_points),
+                                good_target=int(args.bayes_region_min_good_candidates),
+                                unique_counts=tuple(region_status["unique_counts"]),
+                                per_axis_target=int(args.bayes_region_min_points_per_axis),
+                                spans=tuple(region_status["spans"]),
+                                span_targets=(
+                                    float(args.bayes_region_min_span_kp),
+                                    float(args.bayes_region_min_span_ki),
+                                    float(args.bayes_region_min_span_kd),
+                                ),
+                                warmup_trials_done=warmup_trial_count,
+                                warmup_trials_target=warmup_target,
+                            )
                         )
             except EarlyStopOptimization as e:
                 log(f"Early stop: {e}")

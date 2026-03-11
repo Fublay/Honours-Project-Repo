@@ -36,12 +36,20 @@ class RuntimeMonitor:
         self.status_var = tk.StringVar(value="Preparing tuner...")
         self.phase_var = tk.StringVar(value="Phase: Gathering candidates")
         self.progress_var = tk.StringVar(value="Progress: waiting for first trial")
+        self.warmup_counter_var = tk.StringVar(value="Warmup counter: waiting for first trial")
+        self.warmup_change_var = tk.StringVar(value="Warmup change: waiting for first candidate")
+        self.prev_warmup_result_var = tk.StringVar(value="Previous warmup result: none yet")
+        self.readiness_var = tk.StringVar(value="BO readiness:\n- waiting for warmup data")
         self.power_var = tk.StringVar(value="Current power: --")
         self.pid_var = tk.StringVar(value="PID: --")
 
         tk.Label(frame, text="Live Power Output", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
         tk.Label(frame, textvariable=self.phase_var, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(4, 0))
         tk.Label(frame, textvariable=self.progress_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
+        tk.Label(frame, textvariable=self.warmup_counter_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
+        tk.Label(frame, textvariable=self.warmup_change_var, justify="left", anchor="w").pack(anchor="w", pady=(2, 0))
+        tk.Label(frame, textvariable=self.prev_warmup_result_var, justify="left", anchor="w").pack(anchor="w", pady=(2, 0))
+        tk.Label(frame, textvariable=self.readiness_var, justify="left", anchor="w").pack(anchor="w", pady=(4, 0))
         tk.Label(frame, textvariable=self.status_var).pack(anchor="w", pady=(4, 0))
         tk.Label(frame, textvariable=self.power_var).pack(anchor="w", pady=(0, 10))
 
@@ -93,6 +101,30 @@ class RuntimeMonitor:
         if self.closed:
             return
         self.progress_var.set(str(message))
+        self.process_events()
+
+    def set_readiness(self, message: str):
+        if self.closed:
+            return
+        self.readiness_var.set(str(message))
+        self.process_events()
+
+    def set_warmup_counter(self, message: str):
+        if self.closed:
+            return
+        self.warmup_counter_var.set(str(message))
+        self.process_events()
+
+    def set_warmup_change(self, message: str):
+        if self.closed:
+            return
+        self.warmup_change_var.set(str(message))
+        self.process_events()
+
+    def set_previous_warmup_result(self, message: str):
+        if self.closed:
+            return
+        self.prev_warmup_result_var.set(str(message))
         self.process_events()
 
     def set_pid_values(self, kp: float, ki: float, kd: float):
@@ -174,7 +206,7 @@ class RuntimeMonitor:
 
         canvas.create_rectangle(left, top, right, bottom, outline="#808080", tags="plot")
         canvas.create_text(left, bottom + 18, text="0 s", anchor="w", tags="plot")
-        canvas.create_text(left - 8, top, text="Power", anchor="e", tags="plot")
+        canvas.create_text(left - 8, top - 1, text="Power", anchor="e", tags="plot")
 
         if self._times and self._powers:
             t_min = min(self._times)
@@ -182,14 +214,8 @@ class RuntimeMonitor:
             if t_max <= t_min:
                 t_max = t_min + 1.0
 
-            y_min = min(min(self._powers), self.desired_output)
-            y_max = max(max(self._powers), self.desired_output)
-            if y_max <= y_min:
-                y_max = y_min + 1.0
-
-            y_pad = max((y_max - y_min) * 0.1, 1.0)
-            y_min = min(0.0, y_min - y_pad)
-            y_max = y_max + y_pad
+            y_min = 0.0
+            y_max = max(self.desired_output * 1.4, 1.0)
 
             def x_px(value: float) -> float:
                 return left + ((value - t_min) / (t_max - t_min)) * plot_w
