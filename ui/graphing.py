@@ -11,6 +11,19 @@ class RuntimeMonitor:
     """Simple live Tk monitor for current power and active PID values."""
 
     DISPLAY_TIME_OFFSET_S = 0.3
+    DEFAULT_AXIS_COVERAGE = (
+        "Axis coverage:\n"
+        "Kp coverage: waiting\n"
+        "Ki coverage: waiting\n"
+        "Kd coverage: waiting\n"
+        "Blocking axis: none yet"
+    )
+    DEFAULT_BEST_CANDIDATE = (
+        "Best candidate:\n"
+        "PID: --\n"
+        "Score: --\n"
+        "Overshoot: --   Hold: --"
+    )
 
     def __init__(self, root, *, desired_output: float):
         import tkinter as tk
@@ -28,23 +41,54 @@ class RuntimeMonitor:
 
         self.root.title("PID Tuner Monitor")
         self.root.resizable(True, True)
-        self.root.geometry("980x620")
+        self.root.geometry("1120x760")
 
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
 
         self.status_var = tk.StringVar(value="Preparing tuner...")
-        self.phase_var = tk.StringVar(value="Phase: Gathering candidates")
+        self.phase_var = tk.StringVar(value="BOOTSTRAP")
+        self.candidate_source_var = tk.StringVar(value="Candidate source: bootstrap")
+        self.trial_counters_var = tk.StringVar(
+            value="Trials used\nBootstrap: 0\nOptimisation: 0\nValidation: 0"
+        )
+        self.axis_coverage_var = tk.StringVar(value=self.DEFAULT_AXIS_COVERAGE)
+        self.best_candidate_var = tk.StringVar(value=self.DEFAULT_BEST_CANDIDATE)
         self.progress_var = tk.StringVar(value="Progress: waiting for first trial")
-        self.warmup_counter_var = tk.StringVar(value="Warmup counter: waiting for first trial")
+        self.warmup_counter_var = tk.StringVar(value="Bootstrap: waiting for first trial")
         self.warmup_change_var = tk.StringVar(value="Warmup change: waiting for first candidate")
         self.prev_warmup_result_var = tk.StringVar(value="Previous warmup result: none yet")
-        self.readiness_var = tk.StringVar(value="BO readiness:\n- waiting for warmup data")
+        self.readiness_var = tk.StringVar(value="Bootstrap readiness:\n- waiting for bootstrap data")
         self.power_var = tk.StringVar(value="Current power: --")
         self.pid_var = tk.StringVar(value="PID: --")
 
         tk.Label(frame, text="Live Power Output", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
-        tk.Label(frame, textvariable=self.phase_var, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(4, 0))
+
+        summary_row = tk.Frame(frame)
+        summary_row.pack(fill="x", pady=(6, 8))
+        summary_row.grid_columnconfigure(0, weight=3)
+        summary_row.grid_columnconfigure(1, weight=2)
+        summary_row.grid_columnconfigure(2, weight=3)
+
+        left_panel = tk.LabelFrame(summary_row, text="Run Summary", padx=10, pady=8)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        tk.Label(left_panel, text="Current phase", fg="#555555").pack(anchor="w")
+        tk.Label(left_panel, textvariable=self.phase_var, font=("TkDefaultFont", 18, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Label(left_panel, textvariable=self.candidate_source_var, font=("TkDefaultFont", 10, "bold")).pack(
+            anchor="w"
+        )
+        tk.Label(left_panel, textvariable=self.trial_counters_var, justify="left", anchor="w").pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        middle_panel = tk.LabelFrame(summary_row, text="Bootstrap Coverage", padx=10, pady=8)
+        middle_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        tk.Label(middle_panel, textvariable=self.axis_coverage_var, justify="left", anchor="w").pack(anchor="w")
+
+        right_panel = tk.LabelFrame(summary_row, text="Best Candidate", padx=10, pady=8)
+        right_panel.grid(row=0, column=2, sticky="nsew")
+        tk.Label(right_panel, textvariable=self.best_candidate_var, justify="left", anchor="w").pack(anchor="w")
+
         tk.Label(frame, textvariable=self.progress_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
         tk.Label(frame, textvariable=self.warmup_counter_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
         tk.Label(frame, textvariable=self.warmup_change_var, justify="left", anchor="w").pack(anchor="w", pady=(2, 0))
@@ -95,6 +139,86 @@ class RuntimeMonitor:
         if self.closed:
             return
         self.phase_var.set(str(phase))
+        self.process_events()
+
+    def set_candidate_source(self, source: str):
+        if self.closed:
+            return
+        self.candidate_source_var.set(f"Candidate source: {str(source)}")
+        self.process_events()
+
+    def set_trial_counters(self, *, bootstrap_used: int, optimisation_used: int, validation_used: int):
+        if self.closed:
+            return
+        self.trial_counters_var.set(
+            "Trials used\n"
+            f"Bootstrap: {int(bootstrap_used)}\n"
+            f"Optimisation: {int(optimisation_used)}\n"
+            f"Validation: {int(validation_used)}"
+        )
+        self.process_events()
+
+    def set_axis_coverage(self, axis_statuses: list[dict]):
+        if self.closed:
+            return
+
+        def bar(ratio: float) -> str:
+            filled = max(0, min(10, int(round(max(0.0, min(1.0, float(ratio))) * 10.0))))
+            return "[" + ("#" * filled) + ("-" * (10 - filled)) + "]"
+
+        if not axis_statuses:
+            message = self.DEFAULT_AXIS_COVERAGE
+        else:
+            lines = ["Axis coverage:"]
+            blocking_axis = None
+            blocking_score = None
+            for status in axis_statuses:
+                axis_name = str(status.get("axis_name", "?")).capitalize()
+                distinct = int(status.get("distinct_safe_values", 0))
+                target = int(status.get("required_distinct_values", 0))
+                span = float(status.get("safe_span", 0.0))
+                span_target = float(status.get("required_safe_span", 0.0))
+                ratio = float(status.get("coverage_ratio", 0.0))
+                complete = bool(status.get("bootstrap_complete", status.get("complete", False)))
+                if complete:
+                    lines.append(f"{axis_name} coverage: complete")
+                else:
+                    lines.append(
+                        f"{axis_name} coverage: {distinct}/{target}, span {span:.4f}/{span_target:.4f} {bar(ratio)}"
+                    )
+                    deficit_score = float(status.get("deficit_score", 0.0))
+                    if blocking_score is None or deficit_score > blocking_score:
+                        blocking_score = deficit_score
+                        blocking_axis = axis_name
+            lines.append(f"Blocking axis: {blocking_axis if blocking_axis is not None else 'none'}")
+            message = "\n".join(lines)
+        self.axis_coverage_var.set(message)
+        self.process_events()
+
+    def set_best_candidate(
+        self,
+        *,
+        kp: float | None,
+        ki: float | None,
+        kd: float | None,
+        score: float | None,
+        overshoot_pct: float | None = None,
+        hold_quality: float | None = None,
+    ):
+        if self.closed:
+            return
+        if kp is None or ki is None or kd is None or score is None:
+            message = self.DEFAULT_BEST_CANDIDATE
+        else:
+            overshoot_text = "--" if overshoot_pct is None or not np.isfinite(float(overshoot_pct)) else f"{float(overshoot_pct):.2f}%"
+            hold_text = "--" if hold_quality is None or not np.isfinite(float(hold_quality)) else f"{float(hold_quality):.2f}"
+            message = (
+                "Best candidate:\n"
+                f"PID: Kp={float(kp):.4f}  Ki={float(ki):.4f}  Kd={float(kd):.4f}\n"
+                f"Score: {float(score):.2f}\n"
+                f"Overshoot: {overshoot_text}   Hold: {hold_text}"
+            )
+        self.best_candidate_var.set(message)
         self.process_events()
 
     def set_progress(self, message: str):

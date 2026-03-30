@@ -55,6 +55,20 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def ordered_row_fieldnames(rows: list[dict], fallback: list[str]) -> list[str]:
+    """Preserve first-seen key order while including keys from every row."""
+    if not rows:
+        return list(fallback)
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+    return fieldnames
+
+
 # Show a minimal startup menu and return the selected action.
 def prompt_launch_action() -> str:
     while True:
@@ -1395,6 +1409,27 @@ def bootstrap_axes_complete(axis_statuses: list[dict]) -> bool:
     return bool(axis_statuses) and all(bool(status.get("bootstrap_complete", False)) for status in axis_statuses)
 
 
+def find_blocking_bootstrap_axis(axis_statuses: list[dict]) -> dict | None:
+    """Return the incomplete axis with the largest remaining bootstrap deficit."""
+    incomplete_axes = [
+        status
+        for status in axis_statuses
+        if not bool(status.get("bootstrap_complete", status.get("complete", False)))
+    ]
+    if not incomplete_axes:
+        return None
+
+    return max(
+        incomplete_axes,
+        key=lambda status: (
+            float(status.get("deficit_score", 0.0)),
+            -float(status.get("coverage_ratio", 0.0)),
+            -float(status.get("span_coverage", 0.0)),
+            -int(status.get("axis_index", 0)),
+        ),
+    )
+
+
 def choose_bootstrap_axis(
     base_pid: tuple[float, float, float],
     *,
@@ -1443,6 +1478,7 @@ def choose_bootstrap_axis(
     if not probeable_axes:
         return int(preferred_axis_index) % 3, axis_statuses
 
+    blocking_axis = find_blocking_bootstrap_axis(axis_statuses)
     incomplete_axes = [
         (status, is_preferred_axis)
         for status, is_preferred_axis in probeable_axes
@@ -1453,6 +1489,10 @@ def choose_bootstrap_axis(
     def rank_key(item: tuple[dict, bool]) -> tuple[float, float, float, int, int]:
         status, is_preferred_axis = item
         return (
+            0 if (
+                blocking_axis is not None
+                and int(status.get("axis_index", -1)) == int(blocking_axis.get("axis_index", -2))
+            ) else 1,
             -float(status.get("deficit_score", 0.0)),
             float(status.get("coverage_ratio", 1.0)),
             float(status.get("span_coverage", 1.0)),
@@ -1490,12 +1530,11 @@ def assess_bayes_region(
             "unique_counts": (0, 0, 0),
             "spans": (0.0, 0.0, 0.0),
             "axis_statuses": axis_statuses,
+            "blocking_axis": None,
         }
 
     unique_counts = tuple(int(status["distinct_safe_values"]) for status in axis_statuses)
     spans = tuple(float(status["safe_span"]) for status in axis_statuses)
-    required_spans = (float(min_span_kp), float(min_span_ki), float(min_span_kd))
-
     if len(safe_points) < int(min_safe_candidates):
         return {
             "ready": False,
@@ -1503,6 +1542,7 @@ def assess_bayes_region(
             "unique_counts": unique_counts,
             "spans": spans,
             "axis_statuses": axis_statuses,
+            "blocking_axis": None,
         }
 
     if len(good_points) < int(min_good_candidates):
@@ -1512,17 +1552,11 @@ def assess_bayes_region(
             "unique_counts": unique_counts,
             "spans": spans,
             "axis_statuses": axis_statuses,
+            "blocking_axis": None,
         }
 
     if not bootstrap_axes_complete(axis_statuses):
-        incomplete_status = next(
-            (
-                status
-                for status in axis_statuses
-                if not bool(status.get("bootstrap_complete", status.get("complete", False)))
-            ),
-            None,
-        )
+        incomplete_status = find_blocking_bootstrap_axis(axis_statuses)
         if incomplete_status is not None:
             return {
                 "ready": False,
@@ -1534,6 +1568,7 @@ def assess_bayes_region(
                 "unique_counts": unique_counts,
                 "spans": spans,
                 "axis_statuses": axis_statuses,
+                "blocking_axis": str(incomplete_status["axis_name"]).upper(),
             }
 
     return {
@@ -1542,6 +1577,40 @@ def assess_bayes_region(
         "unique_counts": unique_counts,
         "spans": spans,
         "axis_statuses": axis_statuses,
+        "blocking_axis": None,
+    }
+
+
+def assess_bootstrap_progress(
+    *,
+    bootstrap_trials_done: int,
+    bootstrap_trials_minimum: int,
+    max_bootstrap_trials: int,
+    region_status: dict,
+) -> dict:
+    """Combine minimum-trial gating with safe-region readiness for bootstrap control."""
+    minimum_required = max(1, int(bootstrap_trials_minimum))
+    hard_cap = max(minimum_required, int(max_bootstrap_trials))
+    minimum_reached = int(bootstrap_trials_done) >= minimum_required
+    region_ready = bool(region_status.get("ready", False))
+    ready = False
+
+    if minimum_reached and region_ready:
+        ready = True
+        reason = "minimum bootstrap target reached and safe region is ready"
+    elif not minimum_reached:
+        reason = f"minimum bootstrap target not reached yet ({int(bootstrap_trials_done)}/{minimum_required})"
+    else:
+        reason = str(region_status.get("reason", "safe region not ready yet"))
+
+    return {
+        "ready": ready if minimum_reached and region_ready else False,
+        "reason": reason,
+        "minimum_required": minimum_required,
+        "minimum_reached": minimum_reached,
+        "hard_cap": hard_cap,
+        "blocking_axis": region_status.get("blocking_axis"),
+        "region_ready": region_ready,
     }
 
 
@@ -1599,6 +1668,7 @@ def filter_seed_points_for_space(
 
 def format_readiness_status(
     *,
+    bootstrap_status: dict | None,
     region_status: dict,
     safe_count: int,
     safe_target: int,
@@ -1609,28 +1679,61 @@ def format_readiness_status(
     spans: tuple[float, float, float],
     span_targets: tuple[float, float, float],
     warmup_trials_done: int | None = None,
-    warmup_trials_target: int | None = None,
 ) -> str:
     """Build a short GUI checklist for post-warmup optimisation readiness."""
     def mark(done: bool) -> str:
         return "[x]" if done else "[ ]"
 
-    tail = f"Blocked by: {region_status['reason']}"
-    if bool(region_status.get("ready")):
-        tail = "Region ready. Surrogate-guided optimisation can start now."
+    axis_statuses = list(region_status.get("axis_statuses", []))
 
-    return (
-        "BO readiness:\n"
+    def format_axis_line(status: dict) -> str:
+        axis_name = str(status.get("axis_name", "?")).capitalize()
+        if bool(status.get("bootstrap_complete", status.get("complete", False))):
+            return f"{axis_name} coverage: complete"
+        return (
+            f"{axis_name} coverage: "
+            f"{int(status.get('distinct_safe_values', 0))}/{int(status.get('required_distinct_values', 0))}, "
+            f"span {float(status.get('safe_span', 0.0)):.3f}/{float(status.get('required_safe_span', 0.0)):.3f}"
+        )
+
+    bootstrap_line = "Bootstrap progress: waiting for first trial"
+    if bootstrap_status is not None:
+        minimum_state = "reached" if bool(bootstrap_status.get("minimum_reached")) else "not yet reached"
+        bootstrap_line = (
+            f"Bootstrap: {int(warmup_trials_done or 0)} trials run | "
+            f"minimum {int(bootstrap_status.get('minimum_required', 0))} {minimum_state} | "
+            f"cap {int(bootstrap_status.get('hard_cap', 0))}"
+        )
+
+    if bool(bootstrap_status and bootstrap_status.get("ready")):
+        tail = "Blocking axis: none"
+        summary = "Safe region ready. Switching to counted optimisation."
+    else:
+        blocking_axis = None
+        if bootstrap_status is not None:
+            blocking_axis = bootstrap_status.get("blocking_axis")
+        tail = f"Blocking axis: {blocking_axis if blocking_axis else 'None'}"
+        summary = f"Blocked by: {bootstrap_status['reason'] if bootstrap_status is not None else region_status['reason']}"
+
+    lines = [
+        "Bootstrap readiness:",
+        bootstrap_line,
         f"{mark(safe_count >= safe_target)} Safe candidates: {safe_count}/{safe_target}\n"
-        f"{mark(good_count >= good_target)} Good candidates: {good_count}/{good_target}\n"
-        f"{mark(unique_counts[0] >= per_axis_target)} Kp coverage: {unique_counts[0]}/{per_axis_target} | "
-        f"span {spans[0]:.3f}/{span_targets[0]:.3f}\n"
-        f"{mark(unique_counts[1] >= per_axis_target)} Ki coverage: {unique_counts[1]}/{per_axis_target} | "
-        f"span {spans[1]:.3f}/{span_targets[1]:.3f}\n"
-        f"{mark(unique_counts[2] >= per_axis_target)} Kd coverage: {unique_counts[2]}/{per_axis_target} | "
-        f"span {spans[2]:.3f}/{span_targets[2]:.3f}\n"
-        f"{tail}"
-    )
+        f"{mark(good_count >= good_target)} Good candidates: {good_count}/{good_target}",
+    ]
+    if axis_statuses:
+        lines.extend(format_axis_line(status) for status in axis_statuses)
+    else:
+        lines.extend(
+            [
+                f"Kp coverage: {unique_counts[0]}/{per_axis_target}, span {spans[0]:.3f}/{span_targets[0]:.3f}",
+                f"Ki coverage: {unique_counts[1]}/{per_axis_target}, span {spans[1]:.3f}/{span_targets[1]:.3f}",
+                f"Kd coverage: {unique_counts[2]}/{per_axis_target}, span {spans[2]:.3f}/{span_targets[2]:.3f}",
+            ]
+        )
+    lines.append(tail)
+    lines.append(summary)
+    return "\n".join(lines)
 
 
 def format_warmup_change_message(
@@ -2105,19 +2208,30 @@ def main():
                 "unique_counts": (0, 0, 0),
                 "spans": (0.0, 0.0, 0.0),
                 "axis_statuses": [],
+                "blocking_axis": None,
             }
+            bootstrap_target = max(1, int(args.coordinate_warmup_trials))
+            max_bootstrap_trials = max(bootstrap_target, int(args.max_bootstrap_trials))
+            bootstrap_status = assess_bootstrap_progress(
+                bootstrap_trials_done=0,
+                bootstrap_trials_minimum=bootstrap_target,
+                max_bootstrap_trials=max_bootstrap_trials,
+                region_status=region_status,
+            )
             if monitor is not None:
-                bootstrap_target = max(1, int(args.coordinate_warmup_trials))
                 monitor.set_phase("BOOTSTRAP")
                 monitor.set_candidate_source("bootstrap")
                 monitor.set_trial_counters(bootstrap_used=0, optimisation_used=0, validation_used=0)
                 monitor.set_axis_coverage(region_status["axis_statuses"])
                 monitor.set_best_candidate(kp=None, ki=None, kd=None, score=None)
-                monitor.set_warmup_counter(f"Bootstrap counter: 0/{bootstrap_target} completed")
+                monitor.set_warmup_counter(
+                    f"Bootstrap: 0 trials run | minimum {bootstrap_target} not yet reached | cap {max_bootstrap_trials}"
+                )
                 monitor.set_warmup_change("Bootstrap change: baseline trial using current hardware PID (no bootstrap delta)")
                 monitor.set_previous_warmup_result("Previous bootstrap result: none yet")
                 monitor.set_readiness(
                     format_readiness_status(
+                        bootstrap_status=bootstrap_status,
                         region_status=region_status,
                         safe_count=0,
                         safe_target=int(args.bayes_min_safe_trials),
@@ -2132,7 +2246,6 @@ def main():
                             float(args.bayes_region_min_span_kd),
                         ),
                         warmup_trials_done=0,
-                        warmup_trials_target=bootstrap_target,
                     )
                 )
 
@@ -2264,6 +2377,7 @@ def main():
                 nonlocal surrogate_trial_count, bo_trial_count, fallback_trial_count
                 nonlocal baseline_score, best_score_seen, best_pid, best_metrics, last_applied
                 nonlocal no_improve_count, step_kp, step_ki, step_kd, axis_index, surrogate_active
+                nonlocal region_status, bootstrap_status
                 phase = mode_to_phase(mode)
                 is_warmup_mode = mode == "warmup"
                 is_surrogate_mode = mode.startswith("surrogate")
@@ -2487,10 +2601,19 @@ def main():
                         min_span_ki=args.bayes_region_min_span_ki,
                         min_span_kd=args.bayes_region_min_span_kd,
                     )
+                    bootstrap_done = bootstrap_trial_count + 1
+                    bootstrap_status = assess_bootstrap_progress(
+                        bootstrap_trials_done=bootstrap_done,
+                        bootstrap_trials_minimum=bootstrap_target,
+                        max_bootstrap_trials=max_bootstrap_trials,
+                        region_status=region_status,
+                    )
                     log(
                         "Candidate region status -> "
-                        f"ready={region_status['ready']}, "
-                        f"reason={region_status['reason']}, "
+                        f"region_ready={region_status['ready']}, "
+                        f"bootstrap_ready={bootstrap_status['ready']}, "
+                        f"reason={bootstrap_status['reason']}, "
+                        f"blocking_axis={bootstrap_status['blocking_axis']}, "
                         f"safe={len(safe_trial_points)}, "
                         f"good={len(good_trial_points)}, "
                         f"unique={region_status['unique_counts']}, "
@@ -2499,12 +2622,12 @@ def main():
                         f"{region_status['spans'][2]:.4f})"
                     )
                     if monitor is not None:
-                        bootstrap_done = bootstrap_trial_count + 1
-                        bootstrap_target = max(1, int(args.coordinate_warmup_trials))
-                        remaining = max(0, bootstrap_target - bootstrap_done)
                         monitor.set_axis_coverage(region_status["axis_statuses"])
                         monitor.set_warmup_counter(
-                            f"Bootstrap counter: {bootstrap_done}/{bootstrap_target} completed | {remaining} remaining"
+                            f"Bootstrap: {bootstrap_done} trials run | "
+                            f"minimum {bootstrap_target} "
+                            f"{'reached' if bootstrap_status['minimum_reached'] else 'not yet reached'} | "
+                            f"cap {max_bootstrap_trials}"
                         )
                         if is_warmup_mode:
                             monitor.set_previous_warmup_result(
@@ -2523,6 +2646,7 @@ def main():
                         )
                         monitor.set_readiness(
                             format_readiness_status(
+                                bootstrap_status=bootstrap_status,
                                 region_status=region_status,
                                 safe_count=len(safe_trial_points),
                                 safe_target=int(args.bayes_min_safe_trials),
@@ -2537,10 +2661,9 @@ def main():
                                     float(args.bayes_region_min_span_kd),
                                 ),
                                 warmup_trials_done=bootstrap_done,
-                                warmup_trials_target=bootstrap_target,
                             )
                         )
-                        if bool(region_status.get("ready")):
+                        if bool(bootstrap_status.get("ready")):
                             monitor.set_phase("BOOTSTRAP")
                             monitor.set_progress("Surrogate guidance ready | preparing model")
                             monitor.set_warmup_change("Bootstrap change: complete")
@@ -2794,12 +2917,11 @@ def main():
                 monitor.set_phase(format_phase_display("warmup"))
                 monitor.set_candidate_source(format_candidate_source("warmup"))
             try:
-                warmup_target = max(1, int(args.coordinate_warmup_trials))
-                max_bootstrap_trials = max(warmup_target, int(args.max_bootstrap_trials))
-                while bootstrap_trial_count < max_bootstrap_trials and not bool(region_status["ready"]):
+                warmup_target = bootstrap_target
+                while bootstrap_trial_count < max_bootstrap_trials and not bool(bootstrap_status["ready"]):
                     run_coordinate_trial()
 
-                if bool(region_status["ready"]):
+                if bool(bootstrap_status["ready"]):
                     no_improve_count = 0
                     surrogate_budget = max(0, int(n_trials) - max(0, int(args.bo_refine_trials)))
                     bo_budget = max(0, min(int(args.bo_refine_trials), int(n_trials)))
@@ -2810,7 +2932,13 @@ def main():
                     if monitor is not None:
                         monitor.set_phase(format_phase_display("warmup"))
                         monitor.set_warmup_counter("")
-                        monitor.set_readiness("Optimisation readiness:\n[x] Bootstrap complete. Switching to counted optimisation.")
+                        monitor.set_readiness(
+                            "Bootstrap readiness:\n"
+                            f"Bootstrap: {bootstrap_trial_count} trials run | minimum {bootstrap_target} reached | "
+                            f"cap {max_bootstrap_trials}\n"
+                            "Blocking axis: none\n"
+                            "Safe region ready. Switching to counted optimisation."
+                        )
 
                     if args.surrogate_model != "none":
                         surrogate_active = surrogate.fit(
@@ -2884,17 +3012,18 @@ def main():
                     log(
                         "Optimisation phases skipped: "
                         f"no viable safe region found after {bootstrap_trial_count} bootstrap trials "
-                        f"({region_status['reason']})"
+                        f"(minimum {bootstrap_target}, cap {max_bootstrap_trials}; {bootstrap_status['reason']})"
                     )
                     if monitor is not None:
                         monitor.set_phase(format_phase_display("warmup"))
                         monitor.set_candidate_source(format_candidate_source("warmup"))
                         monitor.set_progress(
-                            f"Bootstrap stopped after {bootstrap_trial_count} trials | {region_status['reason']}"
+                            f"Bootstrap stopped after {bootstrap_trial_count} trials | {bootstrap_status['reason']}"
                         )
                         monitor.set_warmup_counter("")
                         monitor.set_readiness(
                             format_readiness_status(
+                                bootstrap_status=bootstrap_status,
                                 region_status=region_status,
                                 safe_count=len(safe_trial_points),
                                 safe_target=int(args.bayes_min_safe_trials),
@@ -2909,7 +3038,6 @@ def main():
                                     float(args.bayes_region_min_span_kd),
                                 ),
                                 warmup_trials_done=bootstrap_trial_count,
-                                warmup_trials_target=warmup_target,
                             )
                         )
             except EarlyStopOptimization as e:
@@ -2962,7 +3090,7 @@ def main():
             )
 
             with open("tuning_history.csv", "w", newline="") as f:
-                fieldnames = list(history[0].keys()) if history else [
+                fieldnames = ordered_row_fieldnames(history, [
                     "trial_index",
                     "phase",
                     "phase_mode",
@@ -2975,14 +3103,14 @@ def main():
                     "ki",
                     "kd",
                     "score",
-                ]
+                ])
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(history)
             log("Saved tuning_history.csv")
 
             with open("tuning_trace_features.csv", "w", newline="") as f:
-                fieldnames = list(trace_feature_rows[0].keys()) if trace_feature_rows else [
+                fieldnames = ordered_row_fieldnames(trace_feature_rows, [
                     "trial_index",
                     "phase",
                     "repeat_index",
@@ -2990,7 +3118,7 @@ def main():
                     "kp",
                     "ki",
                     "kd",
-                ]
+                ])
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(trace_feature_rows)
