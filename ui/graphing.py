@@ -35,6 +35,7 @@ class RuntimeMonitor:
         self._times: list[float] = []
         self._powers: list[float] = []
         self._last_redraw = 0.0
+        self._candidate_reason_base = ""
 
         for child in self.root.winfo_children():
             child.destroy()
@@ -227,7 +228,30 @@ class RuntimeMonitor:
     def set_progress(self, message: str):
         if self.closed:
             return
-        self.progress_var.set(str(message))
+        text = str(message)
+        if self._candidate_reason_base:
+            if text.startswith(self._candidate_reason_base):
+                combined = text
+            elif text:
+                combined = f"{self._candidate_reason_base} | {text}"
+            else:
+                combined = self._candidate_reason_base
+            self.progress_var.set(combined)
+        else:
+            self.progress_var.set(text)
+        self.process_events()
+
+    def set_candidate_info(self, kp: float, ki: float, kd: float, reason: str):
+        """
+        Display the PID currently being tested and why it was selected.
+        This must persist during the test.
+        """
+        if self.closed:
+            return
+
+        self._candidate_reason_base = str(reason)
+        self.pid_var.set(f"Testing PID: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}")
+        self.progress_var.set(self._candidate_reason_base)
         self.process_events()
 
     def set_readiness(self, message: str):
@@ -296,7 +320,7 @@ class RuntimeMonitor:
             progress = f"{phase_name} trial {phase_trial_index} | test {repeat_index}/{repeats}"
         if overall_trial_index is not None:
             progress = f"{progress} | overall {overall_trial_index}"
-        self.progress_var.set(progress)
+        self.set_progress(progress)
         self.power_var.set("Current power: --")
         self._draw_plot(force=True)
         self.process_events()

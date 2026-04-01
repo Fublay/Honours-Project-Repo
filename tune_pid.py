@@ -379,26 +379,33 @@ def format_pid_delta(
     )
 
 
-def format_candidate_reason(
-    mode: str,
+def build_candidate_reason(
+    source: str,
     *,
+    kp: float,
+    ki: float,
+    kd: float,
     best_pid: tuple[float, float, float] | None,
-    candidate_pid: tuple[float, float, float] | None,
-    used_axis: int | None = None,
-    candidate_delta: float | None = None,
 ) -> str:
-    if mode == "surrogate":
-        return "Selected near best PID using surrogate model"
-    if mode == "surrogate_explore":
-        return "Exploring nearby candidate for local improvement"
-    if mode == "bo":
-        return "Selected inside the local refinement box for Bayesian local search"
-    if mode == "validation":
-        return "Re-testing the current best candidate for hold stability"
-    if mode == "fallback" and best_pid is not None and candidate_pid is not None and used_axis is not None:
-        direction = "upward" if float(candidate_delta or 0.0) >= 0.0 else "downward"
-        return f"Refining {AXIS_NAMES[used_axis].upper()} slightly {direction} from best candidate"
-    return "Searching for a stable local region"
+    base = f"Testing candidate from {source}"
+
+    if best_pid is not None:
+        dk = float(kp) - float(best_pid[0])
+        di = float(ki) - float(best_pid[1])
+        dd = float(kd) - float(best_pid[2])
+        base += f" | ΔKp={dk:+.4f}, ΔKi={di:+.4f}, ΔKd={dd:+.4f}"
+
+    if source == "surrogate":
+        return base + " | predicted best from model"
+    if source == "surrogate_explore":
+        return base + " | exploring near best candidate"
+    if source == "fallback":
+        return base + " | local refinement step"
+    if source == "coordinate":
+        return base + " | adjusting one axis"
+    if source == "validation":
+        return base + " | re-testing current best candidate"
+    return base
 
 
 def counted_trial_totals(*, mode: str, n_trials: int, validation_trials: int) -> tuple[int | None, int, int, int]:
@@ -929,12 +936,19 @@ def main() -> None:
                 is_optimisation_mode = phase == "optimisation"
                 reference_best_pid = best_pid
                 candidate_pid = (float(kp), float(ki), float(kd))
-                selection_reason = candidate_reason or format_candidate_reason(
-                    mode,
+                candidate_source_key = (
+                    "coordinate"
+                    if is_warmup_mode
+                    else "validation"
+                    if is_validation_mode
+                    else str(mode)
+                )
+                selection_reason = candidate_reason or build_candidate_reason(
+                    candidate_source_key,
+                    kp=candidate_pid[0],
+                    ki=candidate_pid[1],
+                    kd=candidate_pid[2],
                     best_pid=reference_best_pid,
-                    candidate_pid=candidate_pid,
-                    used_axis=used_axis,
-                    candidate_delta=candidate_delta,
                 )
 
                 if is_warmup_mode:
@@ -978,6 +992,7 @@ def main() -> None:
                     monitor.set_phase(format_phase_display(mode))
                     monitor.set_candidate_source(format_candidate_source(mode))
                     monitor.set_candidate_reason(selection_reason)
+                    monitor.set_candidate_info(candidate_pid[0], candidate_pid[1], candidate_pid[2], selection_reason)
                     monitor.set_trial_counters(
                         bootstrap_used=bootstrap_trial_count + bootstrap_increment,
                         optimisation_used=optimisation_trial_count + optimisation_increment,
