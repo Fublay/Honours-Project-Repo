@@ -37,7 +37,10 @@ from tuning.metrics import compute_trial_metrics, score_controller
 from tuning.search import (
     OnlineSurrogateModel,
     build_bayes_search_space,
+    build_local_refinement_bounds,
     build_surrogate_training_row,
+    clamp_pid_to_bounds,
+    compute_refinement_step_sizes,
     filter_seed_points_for_space,
     propose_coordinate_candidate,
     propose_surrogate_candidate,
@@ -344,23 +347,58 @@ def format_previous_warmup_result_message(
 def format_phase_display(mode: str) -> str:
     if mode == "validation":
         return "VALIDATION"
-    if mode.startswith("surrogate"):
-        return "OPTIMISATION (SURROGATE)"
-    if mode == "bo":
-        return "OPTIMISATION (BO)"
-    if mode == "fallback":
-        return "OPTIMISATION (FALLBACK)"
+    if mode.startswith("surrogate") or mode in {"bo", "fallback"}:
+        return "OPTIMISATION (LOCAL REFINEMENT)"
     return "BOOTSTRAP"
 
 
 def format_candidate_source(mode: str) -> str:
-    if mode.startswith("surrogate"):
-        return "surrogate"
+    if mode == "surrogate":
+        return "surrogate (predicted best)"
+    if mode == "surrogate_explore":
+        return "surrogate (exploration)"
     if mode == "bo":
-        return "BO"
+        return "coordinate refinement"
     if mode == "fallback":
-        return "fallback"
+        return "fallback (local refinement step)"
+    if mode == "validation":
+        return "validation"
     return "bootstrap"
+
+
+def format_pid_delta(
+    candidate_pid: tuple[float, float, float],
+    reference_pid: tuple[float, float, float] | None,
+) -> str:
+    if reference_pid is None:
+        return "dKp=+0.0000, dKi=+0.0000, dKd=+0.0000"
+    return (
+        f"dKp={candidate_pid[0] - reference_pid[0]:+.4f}, "
+        f"dKi={candidate_pid[1] - reference_pid[1]:+.4f}, "
+        f"dKd={candidate_pid[2] - reference_pid[2]:+.4f}"
+    )
+
+
+def format_candidate_reason(
+    mode: str,
+    *,
+    best_pid: tuple[float, float, float] | None,
+    candidate_pid: tuple[float, float, float] | None,
+    used_axis: int | None = None,
+    candidate_delta: float | None = None,
+) -> str:
+    if mode == "surrogate":
+        return "Selected near best PID using surrogate model"
+    if mode == "surrogate_explore":
+        return "Exploring nearby candidate for local improvement"
+    if mode == "bo":
+        return "Selected inside the local refinement box for Bayesian local search"
+    if mode == "validation":
+        return "Re-testing the current best candidate for hold stability"
+    if mode == "fallback" and best_pid is not None and candidate_pid is not None and used_axis is not None:
+        direction = "upward" if float(candidate_delta or 0.0) >= 0.0 else "downward"
+        return f"Refining {AXIS_NAMES[used_axis].upper()} slightly {direction} from best candidate"
+    return "Searching for a stable local region"
 
 
 def counted_trial_totals(*, mode: str, n_trials: int, validation_trials: int) -> tuple[int | None, int, int, int]:
@@ -500,6 +538,12 @@ def main() -> None:
     ap.add_argument("--surrogate-pool-size", type=int, default=36, help="Candidate pool size scored by the surrogate before each proposal")
     ap.add_argument("--surrogate-explore-prob", type=float, default=0.25, help="Exploration probability during surrogate-guided search")
     ap.add_argument("--surrogate-jitter-scale", type=float, default=1.25, help="Scale factor for surrogate proposal jitter around safe/best points")
+    ap.add_argument(
+        "--fallback-refinement-step-scale",
+        type=float,
+        default=0.35,
+        help="Scale factor that shrinks optimisation coordinate steps for local refinement",
+    )
     ap.add_argument("--bo-refine-trials", type=int, default=4, help="Optional BO-style refinement trials after surrogate search (0 disables)")
     ap.add_argument("--validation-trials", type=int, default=1, help="Optional validation re-tests of the final best candidate after optimisation (does not count toward --iters)")
     ap.add_argument("--validation-repeats", type=int, default=5, help="Number of repeated tests per validation candidate")
@@ -697,6 +741,57 @@ def main() -> None:
                     )
                 )
 
+            def refinement_center_pid() -> tuple[float, float, float] | None:
+                if best_pid is not None:
+                    return tuple(float(v) for v in best_pid)
+                if last_applied is not None:
+                    return tuple(float(v) for v in last_applied)
+                return None
+
+            def local_refinement_bounds() -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None:
+                center_pid = refinement_center_pid()
+                if center_pid is None:
+                    return None
+                return build_local_refinement_bounds(
+                    center_pid,
+                    kp_max=args.kp_max,
+                    ki_max=args.ki_max,
+                    kd_max=args.kd_max,
+                    radius_kp=args.refine_radius_kp,
+                    radius_ki=args.refine_radius_ki,
+                    radius_kd=args.refine_radius_kd,
+                )
+
+            def local_refinement_step_sizes(
+                current_step_kp: float,
+                current_step_ki: float,
+                current_step_kd: float,
+            ) -> tuple[float, float, float]:
+                return compute_refinement_step_sizes(
+                    step_kp=current_step_kp,
+                    step_ki=current_step_ki,
+                    step_kd=current_step_kd,
+                    radius_kp=args.refine_radius_kp,
+                    radius_ki=args.refine_radius_ki,
+                    radius_kd=args.refine_radius_kd,
+                    scale=args.fallback_refinement_step_scale,
+                )
+
+            def local_refinement_step_floor() -> tuple[float, float, float]:
+                return compute_refinement_step_sizes(
+                    step_kp=min_step_kp,
+                    step_ki=min_step_ki,
+                    step_kd=min_step_kd,
+                    radius_kp=args.refine_radius_kp,
+                    radius_ki=args.refine_radius_ki,
+                    radius_kd=args.refine_radius_kd,
+                    scale=max(0.5, float(args.fallback_refinement_step_scale)),
+                )
+
+            def clamp_refinement_steps() -> None:
+                nonlocal step_kp, step_ki, step_kd
+                step_kp, step_ki, step_kd = local_refinement_step_sizes(step_kp, step_ki, step_kd)
+
             def mode_to_phase(mode: str) -> str:
                 if mode == "validation":
                     return "validation"
@@ -815,8 +910,10 @@ def main() -> None:
                 *,
                 mode: str,
                 used_axis: int | None = None,
+                candidate_delta: float | None = None,
                 predicted_score: float | None = None,
                 surrogate_enabled: bool = False,
+                candidate_reason: str | None = None,
             ) -> float:
                 nonlocal trial_index, bootstrap_trial_count, optimisation_trial_count, validation_trial_count
                 nonlocal surrogate_trial_count, bo_trial_count, fallback_trial_count
@@ -829,6 +926,16 @@ def main() -> None:
                 is_surrogate_mode = mode.startswith("surrogate")
                 is_bo_mode = mode == "bo"
                 is_validation_mode = mode == "validation"
+                is_optimisation_mode = phase == "optimisation"
+                reference_best_pid = best_pid
+                candidate_pid = (float(kp), float(ki), float(kd))
+                selection_reason = candidate_reason or format_candidate_reason(
+                    mode,
+                    best_pid=reference_best_pid,
+                    candidate_pid=candidate_pid,
+                    used_axis=used_axis,
+                    candidate_delta=candidate_delta,
+                )
 
                 if is_warmup_mode:
                     display_phase_name = "Bootstrap"
@@ -860,11 +967,17 @@ def main() -> None:
                     + (f"/{display_phase_total}" if display_phase_total is not None else "")
                     + f" (overall {trial_index + 1})"
                 )
+                log(
+                    "Candidate selection -> "
+                    f"source={format_candidate_source(mode)}, "
+                    f"reason={selection_reason}, "
+                    f"{format_pid_delta(candidate_pid, reference_best_pid)}"
+                )
 
                 if monitor is not None:
                     monitor.set_phase(format_phase_display(mode))
-                    if not is_validation_mode:
-                        monitor.set_candidate_source(format_candidate_source(mode))
+                    monitor.set_candidate_source(format_candidate_source(mode))
+                    monitor.set_candidate_reason(selection_reason)
                     monitor.set_trial_counters(
                         bootstrap_used=bootstrap_trial_count + bootstrap_increment,
                         optimisation_used=optimisation_trial_count + optimisation_increment,
@@ -919,6 +1032,7 @@ def main() -> None:
                     phase_trial_index=display_phase_index,
                     phase_trial_total=display_phase_total,
                     overall_trial_index=trial_index + 1,
+                    best_pid=reference_best_pid,
                     repeat_cancel_osc_threshold=args.repeat_cancel_osc_threshold,
                     repeat_cancel_score_regression_pct=args.repeat_cancel_score_regression_pct,
                 )
@@ -974,25 +1088,38 @@ def main() -> None:
                 improved = score < prev_best_score
                 if not is_validation_mode:
                     best_score_seen = min(best_score_seen, score)
+                    local_floor_kp, local_floor_ki, local_floor_kd = local_refinement_step_floor()
                     if improved:
                         best_pid = (used_kp, used_ki, used_kd)
                         best_metrics = dict(metrics)
                         no_improve_count = 0
-                        step_kp = max(min_step_kp, step_kp * float(args.step_shrink_factor))
-                        step_ki = max(min_step_ki, step_ki * float(args.step_shrink_factor))
-                        step_kd = max(min_step_kd, step_kd * float(args.step_shrink_factor))
+                        if is_optimisation_mode:
+                            step_kp = max(local_floor_kp, step_kp * float(args.step_shrink_factor))
+                            step_ki = max(local_floor_ki, step_ki * float(args.step_shrink_factor))
+                            step_kd = max(local_floor_kd, step_kd * float(args.step_shrink_factor))
+                            clamp_refinement_steps()
+                        else:
+                            step_kp = max(min_step_kp, step_kp * float(args.step_shrink_factor))
+                            step_ki = max(min_step_ki, step_ki * float(args.step_shrink_factor))
+                            step_kd = max(min_step_kd, step_kd * float(args.step_shrink_factor))
                     else:
                         no_improve_count += 1
                         if used_axis is not None:
                             axis_directions[used_axis] *= -1.0
-                        if baseline_score is not None and baseline_score > 0:
-                            best_improve_pct_so_far = 100.0 * (baseline_score - best_score_seen) / baseline_score
+                        if is_optimisation_mode:
+                            step_kp = max(local_floor_kp, step_kp * float(args.step_shrink_factor))
+                            step_ki = max(local_floor_ki, step_ki * float(args.step_shrink_factor))
+                            step_kd = max(local_floor_kd, step_kd * float(args.step_shrink_factor))
+                            clamp_refinement_steps()
                         else:
-                            best_improve_pct_so_far = 0.0
-                        if best_improve_pct_so_far < float(args.lock_growth_after_improve_pct):
-                            step_kp = min(float(args.max_step_kp), step_kp * float(args.step_growth_factor))
-                            step_ki = min(float(args.max_step_ki), step_ki * float(args.step_growth_factor))
-                            step_kd = min(float(args.max_step_kd), step_kd * float(args.step_growth_factor))
+                            if baseline_score is not None and baseline_score > 0:
+                                best_improve_pct_so_far = 100.0 * (baseline_score - best_score_seen) / baseline_score
+                            else:
+                                best_improve_pct_so_far = 0.0
+                            if best_improve_pct_so_far < float(args.lock_growth_after_improve_pct):
+                                step_kp = min(float(args.max_step_kp), step_kp * float(args.step_growth_factor))
+                                step_ki = min(float(args.max_step_ki), step_ki * float(args.step_growth_factor))
+                                step_kd = min(float(args.max_step_kd), step_kd * float(args.step_growth_factor))
                     if used_axis is not None:
                         axis_index = (used_axis + 1) % 3
 
@@ -1267,6 +1394,8 @@ def main() -> None:
                 return score
 
             def run_surrogate_trial() -> float:
+                bounds = local_refinement_bounds()
+                local_step_kp, local_step_ki, local_step_kd = local_refinement_step_sizes(step_kp, step_ki, step_kd)
                 candidate, predicted, proposal_mode = propose_surrogate_candidate(
                     surrogate,
                     best_pid=best_pid,
@@ -1278,12 +1407,13 @@ def main() -> None:
                     pool_size=args.surrogate_pool_size,
                     explore_prob=args.surrogate_explore_prob,
                     jitter_scale=args.surrogate_jitter_scale,
-                    step_kp=step_kp,
-                    step_ki=step_ki,
-                    step_kd=step_kd,
+                    step_kp=local_step_kp,
+                    step_ki=local_step_ki,
+                    step_kd=local_step_kd,
                     kp_max=args.kp_max,
                     ki_max=args.ki_max,
                     kd_max=args.kd_max,
+                    local_bounds=bounds,
                 )
                 return evaluate_candidate(
                     candidate[0],
@@ -1296,19 +1426,23 @@ def main() -> None:
 
             def run_fallback_trial() -> float:
                 nonlocal axis_index
+                bounds = local_refinement_bounds()
                 base_pid = best_pid if best_pid is not None else last_applied
                 if base_pid is None:
                     base_pid = (0.0, 0.0, 0.0)
+                base_pid = clamp_pid_to_bounds(base_pid, bounds)
+                local_step_kp, local_step_ki, local_step_kd = local_refinement_step_sizes(step_kp, step_ki, step_kd)
                 (kp, ki, kd), used_axis, _, candidate_delta = propose_coordinate_candidate(
                     base_pid,
                     axis_index=axis_index,
                     axis_direction=axis_directions[axis_index % 3],
-                    step_kp=step_kp,
-                    step_ki=step_ki,
-                    step_kd=step_kd,
+                    step_kp=local_step_kp,
+                    step_ki=local_step_ki,
+                    step_kd=local_step_kd,
                     kp_max=args.kp_max,
                     ki_max=args.ki_max,
                     kd_max=args.kd_max,
+                    bounds=bounds,
                 )
                 log(
                     "Fallback candidate -> "
@@ -1323,7 +1457,14 @@ def main() -> None:
                         f"{AXIS_NAMES[used_axis]} {candidate_delta:+.4f} -> "
                         f"candidate=({kp:.4f}, {ki:.4f}, {kd:.4f})"
                     )
-                score = evaluate_candidate(kp, ki, kd, mode="fallback", used_axis=used_axis)
+                score = evaluate_candidate(
+                    kp,
+                    ki,
+                    kd,
+                    mode="fallback",
+                    used_axis=used_axis,
+                    candidate_delta=candidate_delta,
+                )
                 axis_index = (used_axis + 1) % 3
                 return score
 
@@ -1338,13 +1479,27 @@ def main() -> None:
 
                 if bool(bootstrap_status["ready"]):
                     no_improve_count = 0
+                    clamp_refinement_steps()
                     surrogate_budget = max(0, int(n_trials) - max(0, int(args.bo_refine_trials)))
                     bo_budget = max(0, min(int(args.bo_refine_trials), int(n_trials)))
+                    refinement_bounds = local_refinement_bounds()
                     log(
                         f"Bootstrap complete after {bootstrap_trial_count} trials; "
                         f"planned phase budgets -> surrogate={surrogate_budget}, bo_refine={bo_budget}"
                     )
+                    if refinement_bounds is not None:
+                        log(
+                            "Entering optimisation phase -> "
+                            f"local bounds Kp=[{refinement_bounds[0][0]:.4f}, {refinement_bounds[0][1]:.4f}], "
+                            f"Ki=[{refinement_bounds[1][0]:.4f}, {refinement_bounds[1][1]:.4f}], "
+                            f"Kd=[{refinement_bounds[2][0]:.4f}, {refinement_bounds[2][1]:.4f}], "
+                            f"step=({step_kp:.4f},{step_ki:.4f},{step_kd:.4f})"
+                        )
                     if monitor is not None:
+                        monitor.set_phase(format_phase_display("surrogate"))
+                        monitor.set_status("Local stable region found — refining around best candidate")
+                        monitor.set_candidate_source("local refinement")
+                        monitor.set_candidate_reason("Optimisation is now constrained around the best safe PID")
                         monitor.set_readiness(
                             format_readiness_status(
                                 bootstrap_status=bootstrap_status,
@@ -1394,10 +1549,20 @@ def main() -> None:
                             pad_kp=step_kp,
                             pad_ki=step_ki,
                             pad_kd=step_kd,
+                            best_pid=refinement_center_pid(),
+                            refine_radius_kp=args.refine_radius_kp,
+                            refine_radius_ki=args.refine_radius_ki,
+                            refine_radius_kd=args.refine_radius_kd,
                         )
                         seed_points, seed_scores = filter_seed_points_for_space(observed_points, observed_scores, bayes_space)
                         gp_minimize(
-                            lambda x: evaluate_candidate(float(x[0]), float(x[1]), float(x[2]), mode="bo"),
+                            lambda x: evaluate_candidate(
+                                float(x[0]),
+                                float(x[1]),
+                                float(x[2]),
+                                mode="bo",
+                                candidate_reason="Selected inside the local refinement box for Bayesian local search",
+                            ),
                             bayes_space,
                             n_calls=bo_calls,
                             n_initial_points=min(4, max(1, bo_calls)),
@@ -1412,7 +1577,7 @@ def main() -> None:
 
                     remaining_after_bo = max(0, int(n_trials) - optimisation_trials_run)
                     while remaining_after_bo > 0:
-                        log("Using safe fallback coordinate search for remaining optimisation budget")
+                        log("Using local fallback refinement for remaining optimisation budget")
                         run_fallback_trial()
                         remaining_after_bo -= 1
                 else:

@@ -49,6 +49,7 @@ class RuntimeMonitor:
         self.status_var = tk.StringVar(value="Preparing tuner...")
         self.phase_var = tk.StringVar(value="BOOTSTRAP")
         self.candidate_source_var = tk.StringVar(value="Candidate source: bootstrap")
+        self.candidate_reason_var = tk.StringVar(value="Candidate reason: waiting for optimisation")
         self.trial_counters_var = tk.StringVar(
             value="Trials used\nBootstrap: 0\nOptimisation: 0\nValidation: 0"
         )
@@ -76,6 +77,9 @@ class RuntimeMonitor:
         tk.Label(left_panel, textvariable=self.phase_var, font=("TkDefaultFont", 18, "bold")).pack(anchor="w", pady=(0, 6))
         tk.Label(left_panel, textvariable=self.candidate_source_var, font=("TkDefaultFont", 10, "bold")).pack(
             anchor="w"
+        )
+        tk.Label(left_panel, textvariable=self.candidate_reason_var, justify="left", anchor="w", wraplength=310).pack(
+            anchor="w", pady=(4, 0)
         )
         tk.Label(left_panel, textvariable=self.trial_counters_var, justify="left", anchor="w").pack(
             anchor="w", pady=(8, 0)
@@ -145,6 +149,12 @@ class RuntimeMonitor:
         if self.closed:
             return
         self.candidate_source_var.set(f"Candidate source: {str(source)}")
+        self.process_events()
+
+    def set_candidate_reason(self, message: str):
+        if self.closed:
+            return
+        self.candidate_reason_var.set(f"Candidate reason: {str(message)}")
         self.process_events()
 
     def set_trial_counters(self, *, bootstrap_used: int, optimisation_used: int, validation_used: int):
@@ -244,10 +254,26 @@ class RuntimeMonitor:
         self.prev_warmup_result_var.set(str(message))
         self.process_events()
 
-    def set_pid_values(self, kp: float, ki: float, kd: float):
+    def set_pid_values(
+        self,
+        kp: float,
+        ki: float,
+        kd: float,
+        *,
+        best_pid: tuple[float, float, float] | None = None,
+    ):
         if self.closed:
             return
-        self.pid_var.set(f"Current PID values: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}")
+        message = f"Current PID values: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}"
+        if best_pid is not None:
+            delta_kp = float(kp) - float(best_pid[0])
+            delta_ki = float(ki) - float(best_pid[1])
+            delta_kd = float(kd) - float(best_pid[2])
+            message += (
+                "\n"
+                f"Delta from best: dKp={delta_kp:+.4f}  dKi={delta_ki:+.4f}  dKd={delta_kd:+.4f}"
+            )
+        self.pid_var.set(message)
         self.process_events()
 
     def begin_test(

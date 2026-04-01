@@ -95,6 +95,7 @@ def run_trial(
     phase_trial_index: int | None = None,
     phase_trial_total: int | None = None,
     overall_trial_index: int | None = None,
+    best_pid: tuple[float, float, float] | None = None,
     repeat_cancel_osc_threshold: float = 0.35,
     repeat_cancel_score_regression_pct: float = 8.0,
 ):
@@ -154,7 +155,7 @@ def run_trial(
         display_kd = float(current_pid["pw_kd"])
     if monitor is not None:
         monitor.set_target(desired_output)
-        monitor.set_pid_values(display_kp, display_ki, display_kd)
+        monitor.set_pid_values(display_kp, display_ki, display_kd, best_pid=best_pid)
         monitor.set_progress(
             _candidate_progress_message(
                 phase_name=phase_name,

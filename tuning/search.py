@@ -182,6 +182,37 @@ def clamp_pid_to_bounds(pid: tuple[float, float, float], bounds: PidBounds | Non
     return float(clipped[0]), float(clipped[1]), float(clipped[2])
 
 
+def compute_refinement_step_sizes(
+    *,
+    step_kp: float,
+    step_ki: float,
+    step_kd: float,
+    radius_kp: float,
+    radius_ki: float,
+    radius_kd: float,
+    scale: float,
+) -> tuple[float, float, float]:
+    """Convert broader search steps into smaller local-refinement moves."""
+    scaled = np.asarray(
+        [
+            max(float(step_kp) * float(scale), 1e-3),
+            max(float(step_ki) * float(scale), 1e-3),
+            max(float(step_kd) * float(scale), 1e-4),
+        ],
+        dtype=float,
+    )
+    caps = np.asarray(
+        [
+            max(float(radius_kp) * 0.5, 1e-3),
+            max(float(radius_ki) * 0.5, 1e-3),
+            max(float(radius_kd) * 0.5, 1e-4),
+        ],
+        dtype=float,
+    )
+    result = np.minimum(scaled, caps)
+    return float(result[0]), float(result[1]), float(result[2])
+
+
 def filter_points_to_bounds(
     points: list[tuple[float, float, float]],
     bounds: PidBounds | None,
