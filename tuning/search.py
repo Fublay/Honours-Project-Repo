@@ -25,6 +25,7 @@ except Exception:
 
 SURROGATE_FEATURE_NAMES = ("kp", "ki", "kd", "desired_output", "frequency_khz")
 BayesSpaceDim = Any
+PidBounds = tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
 
 
 class OnlineSurrogateModel:
@@ -125,6 +126,78 @@ def build_surrogate_training_row(
     }
 
 
+def build_local_refinement_bounds(
+    best_pid: tuple[float, float, float],
+    *,
+    kp_max: float,
+    ki_max: float,
+    kd_max: float,
+    radius_kp: float,
+    radius_ki: float,
+    radius_kd: float,
+) -> PidBounds:
+    """Build a tight refinement box around the current best PID."""
+    center = np.asarray(best_pid, dtype=float)
+    bounds_max = np.asarray([kp_max, ki_max, kd_max], dtype=float)
+    radii = np.asarray(
+        [
+            max(float(radius_kp), 1e-4),
+            max(float(radius_ki), 1e-4),
+            max(float(radius_kd), 1e-5),
+        ],
+        dtype=float,
+    )
+    lower = np.clip(center - radii, 0.0, bounds_max)
+    upper = np.clip(center + radii, 0.0, bounds_max)
+
+    minimum_widths = np.minimum(radii, np.asarray([kp_max, ki_max, kd_max], dtype=float))
+    for idx in range(3):
+        if upper[idx] > lower[idx]:
+            continue
+        width = max(float(minimum_widths[idx]), 1e-5)
+        if bounds_max[idx] <= 0.0:
+            lower[idx] = 0.0
+            upper[idx] = 0.0
+            continue
+        lower[idx] = float(np.clip(center[idx] - width, 0.0, bounds_max[idx]))
+        upper[idx] = float(np.clip(center[idx] + width, 0.0, bounds_max[idx]))
+        if upper[idx] <= lower[idx]:
+            upper[idx] = min(float(bounds_max[idx]), float(lower[idx] + width))
+            lower[idx] = max(0.0, float(upper[idx] - width))
+
+    return (
+        (float(lower[0]), float(upper[0])),
+        (float(lower[1]), float(upper[1])),
+        (float(lower[2]), float(upper[2])),
+    )
+
+
+def clamp_pid_to_bounds(pid: tuple[float, float, float], bounds: PidBounds | None) -> tuple[float, float, float]:
+    if bounds is None:
+        return tuple(float(v) for v in pid)
+    values = np.asarray(pid, dtype=float)
+    lower = np.asarray([float(pair[0]) for pair in bounds], dtype=float)
+    upper = np.asarray([float(pair[1]) for pair in bounds], dtype=float)
+    clipped = np.clip(values, lower, upper)
+    return float(clipped[0]), float(clipped[1]), float(clipped[2])
+
+
+def filter_points_to_bounds(
+    points: list[tuple[float, float, float]],
+    bounds: PidBounds | None,
+) -> list[tuple[float, float, float]]:
+    if bounds is None:
+        return [tuple(float(v) for v in point) for point in points]
+    lower = np.asarray([float(pair[0]) for pair in bounds], dtype=float)
+    upper = np.asarray([float(pair[1]) for pair in bounds], dtype=float)
+    filtered: list[tuple[float, float, float]] = []
+    for point in points:
+        values = np.asarray(point, dtype=float)
+        if np.all(values >= lower) and np.all(values <= upper):
+            filtered.append((float(values[0]), float(values[1]), float(values[2])))
+    return filtered
+
+
 def propose_surrogate_candidate(
     surrogate: OnlineSurrogateModel,
     *,
@@ -143,21 +216,41 @@ def propose_surrogate_candidate(
     kp_max: float,
     ki_max: float,
     kd_max: float,
+    local_bounds: PidBounds | None = None,
 ) -> tuple[tuple[float, float, float], float, str]:
     """Generate a bounded candidate pool and score it with the surrogate."""
-    center = best_pid or (0.5 * kp_max, 0.5 * ki_max, 0.5 * kd_max)
-    spans = np.asarray([max(step_kp, 1e-3), max(step_ki, 1e-3), max(step_kd, 1e-3)], dtype=float)
+    global_bounds: PidBounds = (
+        (0.0, float(kp_max)),
+        (0.0, float(ki_max)),
+        (0.0, float(kd_max)),
+    )
+    active_bounds = local_bounds or global_bounds
+    center = clamp_pid_to_bounds(
+        best_pid or (0.5 * kp_max, 0.5 * ki_max, 0.5 * kd_max),
+        active_bounds,
+    )
+    lower = np.asarray([float(pair[0]) for pair in active_bounds], dtype=float)
+    upper = np.asarray([float(pair[1]) for pair in active_bounds], dtype=float)
+    bound_spans = np.maximum(upper - lower, np.asarray([1e-3, 1e-3, 1e-4], dtype=float))
+    spans = np.minimum(
+        np.asarray([max(step_kp, 1e-3), max(step_ki, 1e-3), max(step_kd, 1e-4)], dtype=float),
+        np.maximum(bound_spans * 0.5, np.asarray([1e-3, 1e-3, 1e-4], dtype=float)),
+    )
     candidates: list[tuple[float, float, float]] = []
+    candidate_safe_points = filter_points_to_bounds(safe_points, active_bounds)
 
-    if safe_points:
-        for point in safe_points[-min(6, len(safe_points)) :]:
+    if best_pid is not None:
+        candidates.append(center)
+
+    if candidate_safe_points:
+        for point in candidate_safe_points[-min(6, len(candidate_safe_points)) :]:
             candidates.append(tuple(float(v) for v in point))
 
     for _ in range(max(8, int(pool_size))):
-        if rng.random() < 0.5 and best_pid is not None:
+        if best_pid is not None and rng.random() < 0.7:
             base = np.asarray(center, dtype=float)
-        elif safe_points:
-            base = np.asarray(rng.choice(safe_points), dtype=float)
+        elif candidate_safe_points:
+            base = np.asarray(rng.choice(candidate_safe_points), dtype=float)
         else:
             base = np.asarray(center, dtype=float)
         noise = np.asarray(
@@ -168,7 +261,7 @@ def propose_surrogate_candidate(
             ],
             dtype=float,
         )
-        proposal = np.clip(base + noise, [0.0, 0.0, 0.0], [kp_max, ki_max, kd_max])
+        proposal = np.clip(base + noise, lower, upper)
         candidates.append((float(proposal[0]), float(proposal[1]), float(proposal[2])))
 
     deduped: list[tuple[float, float, float]] = []
@@ -182,7 +275,7 @@ def propose_surrogate_candidate(
         deduped.append(candidate)
 
     if not deduped:
-        deduped = [tuple(float(v) for v in center)]
+        deduped = [center]
 
     predictions = surrogate.predict(
         deduped,
@@ -208,24 +301,30 @@ def propose_coordinate_candidate(
     kp_max: float,
     ki_max: float,
     kd_max: float,
+    bounds: PidBounds | None = None,
 ) -> tuple[tuple[float, float, float], int, float, float]:
     """Adjust exactly one PID term from the current base point."""
-    values = [float(base_pid[0]), float(base_pid[1]), float(base_pid[2])]
+    lower_bounds = [0.0, 0.0, 0.0]
+    upper_bounds = [float(kp_max), float(ki_max), float(kd_max)]
+    if bounds is not None:
+        lower_bounds = [float(pair[0]) for pair in bounds]
+        upper_bounds = [float(pair[1]) for pair in bounds]
+    clamped_base = clamp_pid_to_bounds(base_pid, bounds)
+    values = [float(clamped_base[0]), float(clamped_base[1]), float(clamped_base[2])]
     step_sizes = [float(step_kp), float(step_ki), float(step_kd)]
-    max_values = [float(kp_max), float(ki_max), float(kd_max)]
 
     used_axis = int(axis_index) % 3
     direction = 1.0 if axis_direction >= 0 else -1.0
     delta = direction * step_sizes[used_axis]
-    proposed_value = float(np.clip(values[used_axis] + delta, 0.0, max_values[used_axis]))
+    proposed_value = float(np.clip(values[used_axis] + delta, lower_bounds[used_axis], upper_bounds[used_axis]))
 
     if np.isclose(proposed_value, values[used_axis]):
         direction *= -1.0
         delta = direction * step_sizes[used_axis]
-        proposed_value = float(np.clip(values[used_axis] + delta, 0.0, max_values[used_axis]))
+        proposed_value = float(np.clip(values[used_axis] + delta, lower_bounds[used_axis], upper_bounds[used_axis]))
 
     values[used_axis] = proposed_value
-    actual_delta = values[used_axis] - base_pid[used_axis]
+    actual_delta = values[used_axis] - clamped_base[used_axis]
     return (values[0], values[1], values[2]), used_axis, direction, float(actual_delta)
 
 
@@ -238,8 +337,33 @@ def build_bayes_search_space(
     pad_kp: float,
     pad_ki: float,
     pad_kd: float,
+    best_pid: tuple[float, float, float] | None = None,
+    refine_radius_kp: float | None = None,
+    refine_radius_ki: float | None = None,
+    refine_radius_kd: float | None = None,
 ) -> list[BayesSpaceDim]:
-    """Build a local Bayesian search box around the safe region from bootstrap."""
+    """Build a Bayesian search box using local refinement bounds when available."""
+    if (
+        best_pid is not None
+        and refine_radius_kp is not None
+        and refine_radius_ki is not None
+        and refine_radius_kd is not None
+    ):
+        bounds = build_local_refinement_bounds(
+            best_pid,
+            kp_max=kp_max,
+            ki_max=ki_max,
+            kd_max=kd_max,
+            radius_kp=refine_radius_kp,
+            radius_ki=refine_radius_ki,
+            radius_kd=refine_radius_kd,
+        )
+        return [
+            Real(float(bounds[0][0]), float(bounds[0][1]), name="kp"),
+            Real(float(bounds[1][0]), float(bounds[1][1]), name="ki"),
+            Real(float(bounds[2][0]), float(bounds[2][1]), name="kd"),
+        ]
+
     if not safe_pids:
         return [
             Real(0.0, kp_max, name="kp"),
