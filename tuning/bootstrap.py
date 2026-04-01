@@ -12,6 +12,19 @@ from tuning.search import propose_coordinate_candidate
 AXIS_NAMES = ("kp", "ki", "kd")
 
 
+def _dedupe_points(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """Collapse repeated probes of the same PID tuple into a single point."""
+    unique: list[tuple[float, float, float]] = []
+    seen: set[tuple[float, float, float]] = set()
+    for point in points:
+        key = tuple(round(float(value), 6) for value in point)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(tuple(float(value) for value in point))
+    return unique
+
+
 def candidate_is_safe(
     metrics: dict,
     *,
@@ -65,7 +78,8 @@ def compute_bootstrap_axis_status(
 ) -> list[dict]:
     """Secondary diagnostic view of bootstrap spread on each PID axis."""
     required_spans = (float(min_span_kp), float(min_span_ki), float(min_span_kd))
-    if not safe_points:
+    unique_safe_points = _dedupe_points(safe_points)
+    if not unique_safe_points:
         return [
             {
                 "axis_index": idx,
@@ -86,7 +100,7 @@ def compute_bootstrap_axis_status(
             for idx in range(3)
         ]
 
-    safe_arr = np.asarray(safe_points, dtype=float)
+    safe_arr = np.asarray(unique_safe_points, dtype=float)
     statuses: list[dict] = []
     for idx, required_span in enumerate(required_spans):
         axis_values = np.round(safe_arr[:, idx], 6)
@@ -182,8 +196,11 @@ def assess_local_safe_region(
     step_kd: float,
 ) -> dict:
     """Decide whether bootstrap has found a usable local safe region."""
+    unique_safe_points = _dedupe_points(safe_points)
+    unique_good_points = _dedupe_points(good_points)
+    unique_unsafe_points = _dedupe_points(unsafe_points)
     axis_statuses = compute_bootstrap_axis_status(
-        safe_points,
+        unique_safe_points,
         min_points_per_axis=min_points_per_axis,
         min_span_kp=min_span_kp,
         min_span_ki=min_span_ki,
@@ -210,8 +227,8 @@ def assess_local_safe_region(
                 min_span_ki=min_span_ki,
                 min_span_kd=min_span_kd,
             ),
-            "global_safe_count": len(safe_points),
-            "global_good_count": len(good_points),
+            "global_safe_count": len(unique_safe_points),
+            "global_good_count": len(unique_good_points),
         }
 
     radii = _local_radius(
@@ -222,19 +239,25 @@ def assess_local_safe_region(
         min_span_ki=min_span_ki,
         min_span_kd=min_span_kd,
     )
-    local_safe = _nearby_points(safe_points, best_pid, radii)
-    local_good = _nearby_points(good_points, best_pid, radii)
-    local_unsafe = _nearby_points(unsafe_points, best_pid, radii)
+    local_safe = _nearby_points(unique_safe_points, best_pid, radii)
+    local_good = _nearby_points(unique_good_points, best_pid, radii)
+    local_safe_keys = {tuple(round(float(value), 6) for value in point) for point in local_safe}
+    local_good_keys = {tuple(round(float(value), 6) for value in point) for point in local_good}
+    local_unsafe = [
+        point
+        for point in _nearby_points(unique_unsafe_points, best_pid, radii)
+        if tuple(round(float(value), 6) for value in point) not in local_safe_keys | local_good_keys
+    ]
     local_unique_counts, local_spans, varied_axes = _axis_variation(local_safe, radii)
     local_variation_axes = int(sum(varied_axes))
 
     local_safe_target = max(3, min(int(min_safe_candidates), 4))
     local_good_target = max(2, int(min_good_candidates))
-    if len(safe_points) < int(min_safe_candidates):
-        reason = f"only {len(safe_points)} safe candidates collected so far"
+    if len(unique_safe_points) < int(min_safe_candidates):
+        reason = f"only {len(unique_safe_points)} safe candidates collected so far"
         ready = False
-    elif len(good_points) < int(min_good_candidates):
-        reason = f"only {len(good_points)} good candidates have reached and held target"
+    elif len(unique_good_points) < int(min_good_candidates):
+        reason = f"only {len(unique_good_points)} good candidates have reached and held target"
         ready = False
     elif len(local_safe) < local_safe_target:
         reason = (
@@ -291,8 +314,8 @@ def assess_local_safe_region(
         "local_spans": local_spans,
         "local_variation_axes": local_variation_axes,
         "radii": radii,
-        "global_safe_count": len(safe_points),
-        "global_good_count": len(good_points),
+        "global_safe_count": len(unique_safe_points),
+        "global_good_count": len(unique_good_points),
     }
 
 
