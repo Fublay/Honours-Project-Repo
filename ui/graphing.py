@@ -12,11 +12,11 @@ class RuntimeMonitor:
 
     DISPLAY_TIME_OFFSET_S = 0.3
     DEFAULT_AXIS_COVERAGE = (
-        "Axis coverage:\n"
-        "Kp coverage: waiting\n"
-        "Ki coverage: waiting\n"
-        "Kd coverage: waiting\n"
-        "Blocking axis: none yet"
+        "Local region diagnostics:\n"
+        "Global safe spread: waiting\n"
+        "Kp diagnostic: waiting\n"
+        "Ki diagnostic: waiting\n"
+        "Kd diagnostic: waiting"
     )
     DEFAULT_BEST_CANDIDATE = (
         "Best candidate:\n"
@@ -81,7 +81,7 @@ class RuntimeMonitor:
             anchor="w", pady=(8, 0)
         )
 
-        middle_panel = tk.LabelFrame(summary_row, text="Bootstrap Coverage", padx=10, pady=8)
+        middle_panel = tk.LabelFrame(summary_row, text="Bootstrap Region", padx=10, pady=8)
         middle_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
         tk.Label(middle_panel, textvariable=self.axis_coverage_var, justify="left", anchor="w").pack(anchor="w")
 
@@ -169,9 +169,7 @@ class RuntimeMonitor:
         if not axis_statuses:
             message = self.DEFAULT_AXIS_COVERAGE
         else:
-            lines = ["Axis coverage:"]
-            blocking_axis = None
-            blocking_score = None
+            lines = ["Local region diagnostics:"]
             for status in axis_statuses:
                 axis_name = str(status.get("axis_name", "?")).capitalize()
                 distinct = int(status.get("distinct_safe_values", 0))
@@ -181,16 +179,11 @@ class RuntimeMonitor:
                 ratio = float(status.get("coverage_ratio", 0.0))
                 complete = bool(status.get("bootstrap_complete", status.get("complete", False)))
                 if complete:
-                    lines.append(f"{axis_name} coverage: complete")
+                    lines.append(f"{axis_name} diagnostic: stable spread observed")
                 else:
                     lines.append(
-                        f"{axis_name} coverage: {distinct}/{target}, span {span:.4f}/{span_target:.4f} {bar(ratio)}"
+                        f"{axis_name} diagnostic: {distinct}/{target}, span {span:.4f}/{span_target:.4f} {bar(ratio)}"
                     )
-                    deficit_score = float(status.get("deficit_score", 0.0))
-                    if blocking_score is None or deficit_score > blocking_score:
-                        blocking_score = deficit_score
-                        blocking_axis = axis_name
-            lines.append(f"Blocking axis: {blocking_axis if blocking_axis is not None else 'none'}")
             message = "\n".join(lines)
         self.axis_coverage_var.set(message)
         self.process_events()

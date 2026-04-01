@@ -1,42 +1,48 @@
 """Main application entry point for laser PID tuning.
 
-This script provides:
-- startup UI (GUI/CLI) for running actions
-- serial command orchestration for each laser test
-- trial scoring and hybrid PID tuning
-- CSV output for later analysis
-- interactive graphing of stored power traces
+This script keeps the user-facing flow together while the heavier tuning logic
+now lives in focused modules under ``tuning/``.
 """
+
+from __future__ import annotations
 
 import csv
 from datetime import datetime
 import math
 import random
-from typing import Any
 
 import numpy as np
 import serial
+
 try:
     from skopt import gp_minimize
-    from skopt.space import Real
+
     HAVE_SKOPT = True
 except Exception:
     gp_minimize = None
-    Real = None
     HAVE_SKOPT = False
 
-try:
-    from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
-    HAVE_SKLEARN = True
-except Exception:
-    ExtraTreesRegressor = None
-    RandomForestRegressor = None
-    HAVE_SKLEARN = False
-
 import laser_command_ids as CMD
-from pipeline.data_collector import collect_trial_data
 from protocol.reply_parser import parse_ack
 from transport.serial_interface import SerialLineIO
+from tuning.bootstrap import (
+    AXIS_NAMES,
+    assess_bootstrap_progress,
+    assess_local_safe_region,
+    candidate_is_good,
+    candidate_is_safe,
+    choose_bootstrap_axis,
+)
+from tuning.metrics import compute_trial_metrics, score_controller
+from tuning.search import (
+    OnlineSurrogateModel,
+    build_bayes_search_space,
+    build_surrogate_training_row,
+    filter_seed_points_for_space,
+    propose_coordinate_candidate,
+    propose_surrogate_candidate,
+)
+from tuning.trial_runner import run_trial
 from ui.graphing import RuntimeMonitor, prompt_launch_gui, run_graph_tool
 
 
@@ -44,12 +50,6 @@ class EarlyStopOptimization(RuntimeError):
     pass
 
 
-AXIS_NAMES = ("kp", "ki", "kd")
-SURROGATE_FEATURE_NAMES = ("kp", "ki", "kd", "desired_output", "frequency_khz")
-BayesSpaceDim = Any
-
-
-# Print log lines with a simple HH:MM:SS timestamp.
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -69,7 +69,6 @@ def ordered_row_fieldnames(rows: list[dict], fallback: list[str]) -> list[str]:
     return fieldnames
 
 
-# Show a minimal startup menu and return the selected action.
 def prompt_launch_action() -> str:
     while True:
         choice = input("Choose action: [s]tart test, [r]eset defaults, [g]raph power, or [q]uit: ").strip().lower()
@@ -84,7 +83,6 @@ def prompt_launch_action() -> str:
         print("Please enter s, r, g, or q.", flush=True)
 
 
-# Ask for the target power value used to score each PID candidate.
 def prompt_goal_power_output(default_value: float) -> float:
     while True:
         raw = input(f"Enter goal power output [{default_value}]: ").strip()
@@ -96,7 +94,6 @@ def prompt_goal_power_output(default_value: float) -> float:
             print("Please enter a numeric value.", flush=True)
 
 
-# Ask for how many PID trials to run. Each trial executes 5 laser tests.
 def prompt_trial_count(default_value: int) -> int:
     while True:
         raw = input(f"Enter number of trials [{default_value}]: ").strip()
@@ -140,8 +137,8 @@ def configure_program(io: SerialLineIO, *, power_w: float, frequency_khz: int) -
             f"width={current_program['pulse_width_us']:04d}, "
             f"delay={current_program['detect_delay_us']:08d}"
         )
-    except Exception as e:
-        log(f"Warning: Could not read current program values: {e}. Sending requested program values directly.")
+    except Exception as exc:
+        log(f"Warning: Could not read current program values: {exc}. Sending requested program values directly.")
 
     ack = io.set_program_values(
         power_w=power_w,
@@ -171,8 +168,8 @@ def get_program_defaults(io: SerialLineIO, *, fallback_power_w: float, fallback_
             f"delay={current_program['detect_delay_us']:08d}"
         )
         return float(current_program["power_w"]), int(current_program["frequency_khz"])
-    except Exception as e:
-        log(f"Warning: Could not load startup defaults from hardware: {e}")
+    except Exception as exc:
+        log(f"Warning: Could not load startup defaults from hardware: {exc}")
         return float(fallback_power_w), int(fallback_frequency_khz)
 
 
@@ -197,1475 +194,6 @@ def reset_pid_defaults(io: SerialLineIO) -> None:
         raise RuntimeError(f"Reset returned error code: {ack}")
 
 
-# Run one PID candidate across repeated timed tests.
-def run_trial(
-    io: SerialLineIO,
-    kp: float,
-    ki: float,
-    kd: float,
-    desired_output: float,
-    apply_pid_update: bool = True,
-    repeats: int = 5,
-    test_duration_s: float = 12.0,
-    startup_grace_s: float = 2.0,
-    settled_window_samples: int = 5,
-    duration: float = 8.0,
-    kp_max: float = 1.0,
-    ki_max: float = 1.0,
-    kd_max: float = 0.2,
-    monitor: RuntimeMonitor | None = None,
-    trial_index: int | None = None,
-    phase_name: str | None = None,
-    phase_trial_index: int | None = None,
-    phase_trial_total: int | None = None,
-    overall_trial_index: int | None = None,
-    repeat_cancel_osc_threshold: float = 0.35,
-    repeat_cancel_score_regression_pct: float = 8.0,
-):
-    """Run one PID candidate through repeated laser tests and collect telemetry.
-
-    A "trial" in this project means one PID tuple (kp, ki, kd) tested several
-    times (`repeats`) so scoring is less sensitive to one noisy run.
-    """
-    _ = duration  # Kept for CLI compatibility with older call sites.
-    log(f"Starting trial: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
-
-    # Clamp gains to safe search limits before sending anything to hardware.
-    kp = float(np.clip(kp, 0.0, kp_max))
-    ki = float(np.clip(ki, 0.0, ki_max))
-    kd = float(np.clip(kd, 0.0, kd_max))
-
-    # Enable the debug stream so B0 power telemetry is available during tests.
-    try:
-        io.write_command_expect_ok_ack("000B", command_id_hex2=CMD.SET_DEBUG, timeout=2.0)
-        log("SET_DEBUG acknowledged with *00")
-    except Exception as e:
-        raise RuntimeError(f"SET_DEBUG did not receive success ACK '*00': {e}") from e
-
-    # Read current PID values from the laser once at trial start.
-    try:
-        current_pid = io.get_pid_values(timeout=2.0)
-        log(
-            "Current PID values: "
-            f"PW Kp={current_pid['pw_kp']:.4f}, "
-            f"Ki={current_pid['pw_ki']:.4f}, "
-            f"Kd={current_pid['pw_kd']:.4f}"
-        )
-    except Exception as e:
-        log(f"Warning: Could not read current PID values: {e}. Using defaults for PP parameters.")
-        current_pid = None
-
-    # Convert sample interval to seconds. Many controllers report milliseconds here.
-    sample_interval_s = None
-    if current_pid is not None:
-        raw_si = float(current_pid.get("sample_interval", 0.0))
-        if raw_si > 0:
-            sample_interval_s = raw_si / 1000.0 if raw_si > 1.0 else raw_si
-            log(f"Using telemetry sample interval: {sample_interval_s:.6f}s")
-
-    # First trial can run with the laser's live PID values as a baseline.
-    if apply_pid_update:
-        ack = io.set_pid_values(
-            pw_kp=kp,
-            pw_ki=ki,
-            pw_kd=kd,
-            current_values=current_pid,
-            timeout=2.0,
-        )
-        ok_ack, _ = parse_ack(ack)
-        if not ack.startswith("*"):
-            log(f"Warning: Unexpected SET_PID acknowledgment: {ack}")
-        elif not ok_ack:
-            log(f"Warning: SET_PID returned error code: {ack}")
-    else:
-        log("First trial: using current laser PID values without override")
-
-    display_kp, display_ki, display_kd = kp, ki, kd
-    if (not apply_pid_update) and current_pid is not None:
-        display_kp = float(current_pid["pw_kp"])
-        display_ki = float(current_pid["pw_ki"])
-        display_kd = float(current_pid["pw_kd"])
-    if monitor is not None:
-        monitor.set_target(desired_output)
-        monitor.set_pid_values(display_kp, display_ki, display_kd)
-        if phase_name is not None and phase_trial_index is not None:
-            progress = f"{phase_name} trial {phase_trial_index}"
-            if phase_trial_total is not None:
-                progress = f"{progress}/{phase_trial_total}"
-            if overall_trial_index is not None:
-                progress = f"{progress} | overall {overall_trial_index}"
-            monitor.set_progress(f"{progress} | configuring hardware")
-        elif trial_index is not None:
-            monitor.set_progress(f"Trial {trial_index} | configuring hardware")
-
-    # Prepare output arrays for all repeats under this PID candidate.
-    t_vals, y_vals, u_vals, status_vals = [], [], [], []
-    per_test_powers: list[np.ndarray] = []
-    per_test_times: list[np.ndarray] = []
-    per_test_meta: list[dict] = []
-    repeat_scores: list[float] = []
-    cancelled_candidate = False
-    cancel_reason = ""
-
-    # Put the laser into run mode and open shutter before individual test starts.
-    io.write_command_expect_ok_ack("", command_id_hex2=CMD.RUN, timeout=2.0)
-    io.write_command_expect_ok_ack("1", command_id_hex2=CMD.SHUTTER_CONTROL, timeout=2.0)
-
-    try:
-        # Repeat the same PID candidate several times to reduce one-off noise.
-        for rep in range(repeats):
-            log(f"Test {rep + 1}/{repeats}: START")
-            if monitor is not None:
-                monitor.begin_test(
-                    phase_name=(phase_name or "Trial"),
-                    phase_trial_index=(phase_trial_index or trial_index or 0),
-                    phase_trial_total=phase_trial_total,
-                    repeat_index=rep + 1,
-                    repeats=repeats,
-                    overall_trial_index=overall_trial_index,
-                )
-            io.write_command_expect_ok_ack(
-                "",
-                command_id_hex2=CMD.START,
-                timeout=2.0,
-                # Some controller firmware returns *08 here when START is
-                # accepted from the current machine state.
-                accepted_codes=("00", "08", "80"),
-            )
-
-            test_meta = {
-                "invalid": False,
-                "reason": "",
-                "settled": False,
-                "strict_bad_rate": 1.0,
-                "oscillation_rate": 1.0,
-                "stopped_early": False,
-                "start_skewed": False,
-                "start_skew_error": 0.0,
-            }
-            recent_within_5pct = []
-            strict_bad_count = 0
-            strict_total = 0
-            settled_errors: list[float] = []
-            first_seen = False
-
-            base = max(abs(desired_output), 1e-6)
-            limit_30 = 0.30 * base
-            limit_5 = 0.05 * base
-            limit_1 = 0.01 * base
-            osc_deadband = 0.03 * base
-
-            def on_sample(t_val, mapped) -> bool:
-                nonlocal strict_bad_count, strict_total, first_seen
-                y_val = float(mapped["process_value"])
-                if monitor is not None:
-                    monitor.append_sample(t_val, y_val, status=str(mapped.get("status", "RUNNING")))
-                err = y_val - desired_output
-                abs_err = abs(err)
-
-                if not first_seen:
-                    first_seen = True
-                    # Use the B0 initial power field (first section) when available.
-                    first_power = float(mapped.get("initial_power", y_val))
-                    first_err = abs(first_power - desired_output)
-                    low_limit = desired_output - limit_30
-                    high_limit = desired_output + limit_30
-                    log(
-                        f"Initial power check -> value={first_power:.4f}, "
-                        f"allowed=[{low_limit:.4f}, {high_limit:.4f}]"
-                    )
-                    if first_err > limit_30:
-                        test_meta["start_skewed"] = True
-                        test_meta["start_skew_error"] = float(first_err)
-                        test_meta["reason"] = (
-                            f"start skewed beyond +/-30% "
-                            f"(initial={first_power:.4f}, target={desired_output:.4f})"
-                        )
-                        log(f"Test {rep + 1}/{repeats} note: {test_meta['reason']}")
-
-                if t_val < startup_grace_s:
-                    return False
-
-                within_5 = abs_err <= limit_5
-                recent_within_5pct.append(within_5)
-                if len(recent_within_5pct) > settled_window_samples:
-                    recent_within_5pct.pop(0)
-
-                if (not test_meta["settled"]) and len(recent_within_5pct) == settled_window_samples:
-                    if all(recent_within_5pct):
-                        test_meta["settled"] = True
-
-                if test_meta["settled"]:
-                    if abs_err > limit_5:
-                        test_meta["invalid"] = True
-                        test_meta["reason"] = (
-                            f"settled reading out of +/-5% "
-                            f"(value={y_val:.4f}, target={desired_output:.4f})"
-                        )
-                        try:
-                            io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
-                            test_meta["stopped_early"] = True
-                        except Exception as stop_err:
-                            log(f"Warning: failed to send immediate STOP on invalid test: {stop_err}")
-                        return True
-
-                    strict_total += 1
-                    if abs_err > limit_1:
-                        strict_bad_count += 1
-
-                    settled_errors.append(float(err))
-
-                return False
-
-            # Collect telemetry for a fixed window, then stop this test pass.
-            rt, ry, ru, rs = collect_trial_data(
-                io,
-                line_timeout=0.5,
-                sample_interval_s=sample_interval_s,
-                duration_s=test_duration_s,
-                stop_on_done=False,
-                on_sample=on_sample,
-            )
-
-            # Shift each repeat's time axis so combined arrays stay monotonic.
-            t_offset = rep * test_duration_s
-            t_vals.extend([float(v) + t_offset for v in rt])
-            y_vals.extend(ry)
-            u_vals.extend(ru)
-            status_vals.extend(rs)
-            per_test_powers.append(np.array(ry, dtype=float))
-            per_test_times.append(np.array(rt, dtype=float))
-
-            if strict_total > 0:
-                test_meta["strict_bad_rate"] = strict_bad_count / strict_total
-            else:
-                test_meta["strict_bad_rate"] = 1.0
-
-            significant_error_signs = []
-            for settled_err in settled_errors:
-                if abs(settled_err) < osc_deadband:
-                    continue
-                significant_error_signs.append(1 if settled_err > 0 else -1)
-            if len(significant_error_signs) >= 2:
-                sign_flips = sum(
-                    1
-                    for prev_sign, curr_sign in zip(significant_error_signs, significant_error_signs[1:])
-                    if prev_sign != curr_sign
-                )
-                test_meta["oscillation_rate"] = sign_flips / float(len(significant_error_signs) - 1)
-            else:
-                test_meta["oscillation_rate"] = 0.0 if test_meta["settled"] else 1.0
-
-            if not ry and not test_meta["invalid"]:
-                test_meta["invalid"] = True
-                test_meta["reason"] = "no samples collected"
-            if not test_meta["settled"] and not test_meta["invalid"]:
-                # Did not settle within test window: keep valid, but penalize in metrics.
-                test_meta["reason"] = "did not settle"
-
-            per_test_meta.append(test_meta)
-            repeat_score = score_single_repeat(per_test_powers[-1], test_meta, desired_output)
-            repeat_scores.append(repeat_score)
-
-            # Print quick power stats for this repeat to spot unstable behavior.
-            if ry:
-                avg_power = float(np.mean(ry))
-                min_power = float(np.min(ry))
-                max_power = float(np.max(ry))
-                log(
-                    f"Test {rep + 1}/{repeats} current_power -> "
-                    f"avg={avg_power:.4f}, min={min_power:.4f}, max={max_power:.4f}, n={len(ry)}"
-                )
-            else:
-                log(f"Test {rep + 1}/{repeats} current_power -> no samples")
-
-            if test_meta["invalid"]:
-                log(f"Test {rep + 1}/{repeats} invalid: {test_meta['reason']}")
-            elif test_meta["reason"]:
-                log(f"Test {rep + 1}/{repeats} note: {test_meta['reason']}")
-
-            if rep >= 2:
-                prev_repeat_score = repeat_scores[-2]
-                score_regression_pct = 0.0
-                if prev_repeat_score > 1e-9:
-                    score_regression_pct = 100.0 * (repeat_score - prev_repeat_score) / prev_repeat_score
-                if test_meta["oscillation_rate"] >= repeat_cancel_osc_threshold:
-                    cancelled_candidate = True
-                    cancel_reason = (
-                        f"repeat {rep + 1} oscillation too high "
-                        f"({test_meta['oscillation_rate']:.3f} >= {repeat_cancel_osc_threshold:.3f})"
-                    )
-                elif score_regression_pct >= float(repeat_cancel_score_regression_pct):
-                    cancelled_candidate = True
-                    cancel_reason = (
-                        f"repeat {rep + 1} score regressed by {score_regression_pct:.1f}% "
-                        f"({repeat_score:.3f} > {prev_repeat_score:.3f})"
-                    )
-
-            if not test_meta["stopped_early"]:
-                io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
-                log(f"Test {rep + 1}/{repeats}: STOP")
-                if monitor is not None:
-                    if phase_name is not None and phase_trial_index is not None:
-                        progress = f"{phase_name} trial {phase_trial_index}"
-                        if phase_trial_total is not None:
-                            progress = f"{progress}/{phase_trial_total}"
-                        if overall_trial_index is not None:
-                            progress = f"{progress} | overall {overall_trial_index}"
-                        monitor.set_progress(f"{progress} | test {rep + 1}/{repeats} stopped")
-                    elif trial_index is not None:
-                        monitor.set_progress(f"Trial {trial_index} | test {rep + 1}/{repeats} stopped")
-            else:
-                log(f"Test {rep + 1}/{repeats}: STOP (already sent on invalid condition)")
-
-            if cancelled_candidate:
-                log(f"Cancelling remaining repeats for this PID candidate: {cancel_reason}")
-                break
-    finally:
-        # Always leave hardware in a safe idle state at end of a candidate.
-        try:
-            io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
-        except Exception:
-            pass
-        io.write_command_expect_ok_ack("0", command_id_hex2=CMD.SHUTTER_CONTROL, timeout=2.0)
-        io.write_command_expect_ok_ack("", command_id_hex2=CMD.STANDBY, timeout=2.0)
-        log("End of PID set: shutter closed, standby set")
-        if monitor is not None:
-            if phase_name is not None and phase_trial_index is not None:
-                progress = f"{phase_name} trial {phase_trial_index}"
-                if phase_trial_total is not None:
-                    progress = f"{progress}/{phase_trial_total}"
-                if overall_trial_index is not None:
-                    progress = f"{progress} | overall {overall_trial_index}"
-                monitor.set_progress(f"{progress} | shutter closed, standby set")
-            elif trial_index is not None:
-                monitor.set_progress(f"Trial {trial_index} | shutter closed, standby set")
-
-    aborted = any(s == "ABORT" for s in status_vals)
-    start_skew_count = sum(1 for meta in per_test_meta if bool(meta.get("start_skewed", False)))
-    start_skew_threshold = max(2, (len(per_test_meta) // 2) + 1) if per_test_meta else 2
-    if start_skew_count >= start_skew_threshold:
-        summary_reason = (
-            f"start skew exceeded +/-30% in {start_skew_count}/{len(per_test_meta)} repeats"
-        )
-        for meta in per_test_meta:
-            if bool(meta.get("start_skewed", False)) and not bool(meta.get("invalid", False)):
-                meta["invalid"] = True
-                meta["reason"] = summary_reason
-        if repeat_scores:
-            repeat_scores = [
-                999.0 if bool(meta.get("start_skewed", False)) else score
-                for meta, score in zip(per_test_meta, repeat_scores)
-            ]
-        log(f"Candidate start-skew rule triggered: {summary_reason}")
-    if aborted:
-        log("Warning: Trial aborted due to safety condition")
-    if cancelled_candidate:
-        log(f"Trial ended early after repeated-test regression: {cancel_reason}")
-
-    return (
-        np.array(t_vals),
-        np.array(y_vals),
-        np.array(u_vals),
-        aborted,
-        current_pid,
-        per_test_powers,
-        per_test_times,
-        per_test_meta,
-        cancelled_candidate,
-        cancel_reason,
-    )
-
-
-def _safe_mean(values: list[float], default: float) -> float:
-    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
-    return float(np.mean(finite)) if finite else float(default)
-
-
-def _safe_std(values: list[float], default: float) -> float:
-    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
-    return float(np.std(finite)) if finite else float(default)
-
-
-def _clean_trace(times: np.ndarray, readings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    times_arr = np.asarray(times, dtype=float).flatten()
-    readings_arr = np.asarray(readings, dtype=float).flatten()
-    n = int(min(times_arr.size, readings_arr.size))
-    if n == 0:
-        return np.array([], dtype=float), np.array([], dtype=float)
-    times_arr = times_arr[:n]
-    readings_arr = readings_arr[:n]
-    mask = np.isfinite(times_arr) & np.isfinite(readings_arr)
-    if not np.any(mask):
-        return np.array([], dtype=float), np.array([], dtype=float)
-    times_arr = times_arr[mask]
-    readings_arr = readings_arr[mask]
-    if times_arr.size <= 1:
-        return times_arr, readings_arr
-    order = np.argsort(times_arr, kind="stable")
-    return times_arr[order], readings_arr[order]
-
-
-def _sample_widths(times: np.ndarray) -> np.ndarray:
-    if times.size <= 1:
-        return np.ones(int(max(1, times.size)), dtype=float)
-    deltas = np.diff(times)
-    positive = deltas[deltas > 1e-9]
-    default_dt = float(np.median(positive)) if positive.size else 1.0
-    widths = np.empty(times.size, dtype=float)
-    widths[:-1] = np.where(deltas > 1e-9, deltas, default_dt)
-    widths[-1] = default_dt
-    return widths
-
-
-def _integral(times: np.ndarray, values: np.ndarray) -> float:
-    if times.size == 0 or values.size == 0:
-        return 0.0
-    if times.size == 1:
-        return float(abs(values[0]))
-    deltas = np.diff(times)
-    if deltas.size == 0:
-        return float(abs(values[0]))
-    left = np.asarray(values[:-1], dtype=float)
-    right = np.asarray(values[1:], dtype=float)
-    area = 0.5 * (left + right) * deltas
-    return float(np.sum(area))
-
-
-def _first_index(mask: np.ndarray) -> int | None:
-    idx = np.flatnonzero(mask)
-    if idx.size == 0:
-        return None
-    return int(idx[0])
-
-
-def _compute_rise_time(times: np.ndarray, readings: np.ndarray, target: float) -> float | None:
-    if times.size < 2 or readings.size < 2:
-        return None
-    start = float(readings[0])
-    amplitude = float(target - start)
-    if abs(amplitude) < 1e-9:
-        return 0.0 if abs(start - target) < max(abs(target) * 0.05, 1.0) else None
-    norm = (readings - start) / amplitude
-    i10 = _first_index(norm >= 0.1)
-    i90 = _first_index(norm >= 0.9)
-    if i10 is None or i90 is None or i90 < i10:
-        return None
-    return float(times[i90] - times[i10])
-
-
-def _compute_settling_time(
-    times: np.ndarray,
-    abs_error: np.ndarray,
-    tolerance: float,
-    *,
-    settled_window_samples: int = 5,
-    settle_success_ratio: float = 0.85,
-) -> float | None:
-    if times.size == 0 or abs_error.size == 0:
-        return None
-    if tolerance <= 0:
-        return None
-    within = abs_error <= tolerance
-    window = max(2, int(min(settled_window_samples, max(2, times.size))))
-    for start_idx in range(0, max(1, times.size - window + 1)):
-        window_ok = within[start_idx : start_idx + window]
-        if window_ok.size < window or not np.all(window_ok):
-            continue
-        tail = within[start_idx:]
-        if float(np.mean(tail.astype(float))) >= float(settle_success_ratio):
-            return float(times[start_idx])
-    return None
-
-
-def _count_sign_changes(values: np.ndarray, deadband: float) -> int:
-    signs = []
-    for value in values:
-        if abs(float(value)) <= deadband:
-            continue
-        signs.append(1 if value > 0 else -1)
-    if len(signs) < 2:
-        return 0
-    return int(sum(1 for prev, curr in zip(signs, signs[1:]) if prev != curr))
-
-
-def extract_early_trace_features(
-    times: np.ndarray,
-    readings: np.ndarray,
-    desired_output: float,
-    *,
-    early_window_s: float = 2.0,
-) -> dict:
-    """Summarise the first part of a trace for future early-abort models."""
-    times_arr, readings_arr = _clean_trace(times, readings)
-    if times_arr.size == 0:
-        return {
-            "early_window_s": float(early_window_s),
-            "early_sample_count": 0.0,
-            "early_slope": 0.0,
-            "early_mean_error": float(abs(desired_output)),
-            "early_max_error": float(abs(desired_output)),
-        }
-
-    window_mask = times_arr <= (float(times_arr[0]) + float(max(early_window_s, 0.1)))
-    early_times = times_arr[window_mask]
-    early_readings = readings_arr[window_mask]
-    if early_times.size < 2:
-        early_times = times_arr[: min(3, times_arr.size)]
-        early_readings = readings_arr[: early_times.size]
-    early_errors = early_readings - float(desired_output)
-    duration = float(max(early_times[-1] - early_times[0], 1e-6))
-    early_slope = float((early_readings[-1] - early_readings[0]) / duration) if early_times.size >= 2 else 0.0
-    return {
-        "early_window_s": float(early_window_s),
-        "early_sample_count": float(early_times.size),
-        "early_slope": early_slope,
-        "early_mean_error": float(np.mean(np.abs(early_errors))) if early_errors.size else 0.0,
-        "early_max_error": float(np.max(np.abs(early_errors))) if early_errors.size else 0.0,
-    }
-
-
-def extract_repeat_features(
-    times: np.ndarray,
-    readings: np.ndarray,
-    desired_output: float,
-    *,
-    settled_window_samples: int = 5,
-    tolerance_pct: float = 0.05,
-    hold_tail_fraction: float = 0.33,
-    hold_min_samples: int = 5,
-) -> dict:
-    """Compute lightweight control features from one repeat trace."""
-    times_arr, readings_arr = _clean_trace(times, readings)
-    empty_result = {
-        "start_error": 999.0,
-        "track_error": 999.0,
-        "deviation": 999.0,
-        "max_error": 999.0,
-        "overshoot_pct": 100.0,
-        "settling_time_s": math.nan,
-        "rise_time_s": math.nan,
-        "steady_state_error": 999.0,
-        "iae": 999.0,
-        "ise": 999.0,
-        "itae": 999.0,
-        "peak_value": math.nan,
-        "peak_time_s": math.nan,
-        "time_in_tolerance_s": 0.0,
-        "time_to_first_tolerance_s": math.nan,
-        "post_settle_variance": 999.0,
-        "early_slope": 0.0,
-        "oscillation_count": 0.0,
-        "area_above_target": 0.0,
-        "area_below_target": 0.0,
-        "trace_duration_s": 0.0,
-        "hold_duration_s": 0.0,
-        "hold_mean_error": 999.0,
-        "hold_variance": 999.0,
-        "hold_drift": 999.0,
-        "hold_time_in_tolerance_ratio": 0.0,
-        "hold_oscillation_count": 0.0,
-        "hold_quality": 999.0,
-    }
-    if times_arr.size == 0:
-        return empty_result
-
-    target = float(desired_output)
-    base = max(abs(target), 1e-6)
-    tolerance = max(base * float(tolerance_pct), 1e-6)
-    widths = _sample_widths(times_arr)
-    error = readings_arr - target
-    abs_error = np.abs(error)
-    start_error = abs(float(readings_arr[0]) - target)
-    track_error = float(np.mean(abs_error))
-    deviation = float(np.std(readings_arr))
-    max_error = float(np.max(abs_error))
-    peak_idx = int(np.argmax(readings_arr))
-    peak_value = float(readings_arr[peak_idx])
-    peak_time_s = float(times_arr[peak_idx])
-    overshoot_pct = max(0.0, (peak_value - target) / base * 100.0)
-    settling_time_s = _compute_settling_time(
-        times_arr,
-        abs_error,
-        tolerance,
-        settled_window_samples=settled_window_samples,
-    )
-    rise_time_s = _compute_rise_time(times_arr, readings_arr, target)
-    steady_slice = readings_arr[-max(3, readings_arr.size // 4) :]
-    steady_state_error = float(np.mean(steady_slice) - target) if steady_slice.size else 999.0
-    iae = _integral(times_arr, abs_error)
-    ise = _integral(times_arr, error**2)
-    itae = _integral(times_arr, np.abs(error) * np.maximum(times_arr - float(times_arr[0]), 0.0))
-    within_tol = abs_error <= tolerance
-    time_in_tolerance_s = float(np.sum(widths[within_tol])) if within_tol.size else 0.0
-    first_tol_idx = _first_index(within_tol)
-    time_to_first_tolerance_s = float(times_arr[first_tol_idx]) if first_tol_idx is not None else math.nan
-    post_settle_variance = deviation
-    if settling_time_s is not None:
-        post_mask = times_arr >= settling_time_s
-        if np.any(post_mask):
-            post_settle_variance = float(np.var(readings_arr[post_mask]))
-    early_features = extract_early_trace_features(times_arr, readings_arr, target)
-    area_above_target = _integral(times_arr, np.maximum(error, 0.0))
-    area_below_target = _integral(times_arr, np.maximum(-error, 0.0))
-    oscillation_count = _count_sign_changes(error, deadband=0.03 * base)
-    trace_duration_s = float(max(times_arr[-1] - times_arr[0], 0.0)) if times_arr.size >= 2 else 0.0
-
-    hold_sample_count = min(
-        readings_arr.size,
-        max(int(math.ceil(readings_arr.size * float(hold_tail_fraction))), int(hold_min_samples)),
-    )
-    hold_readings = readings_arr[-hold_sample_count:]
-    hold_times = times_arr[-hold_sample_count:]
-    hold_errors = hold_readings - target
-    hold_widths = _sample_widths(hold_times)
-    hold_duration_s = float(np.sum(hold_widths)) if hold_widths.size else 0.0
-    hold_mean_error = float(np.mean(hold_readings) - target) if hold_readings.size else 999.0
-    hold_variance = float(np.var(hold_readings)) if hold_readings.size else 999.0
-    hold_midpoint = max(1, hold_readings.size // 2)
-    hold_first = hold_readings[:hold_midpoint]
-    hold_second = hold_readings[hold_midpoint:]
-    if hold_first.size and hold_second.size:
-        hold_drift = float(abs(np.mean(hold_second) - np.mean(hold_first)))
-    else:
-        hold_drift = float(abs(hold_mean_error))
-    hold_within_tol = np.abs(hold_errors) <= tolerance
-    if hold_widths.size and np.sum(hold_widths) > 0:
-        hold_time_in_tolerance_ratio = float(np.sum(hold_widths[hold_within_tol]) / np.sum(hold_widths))
-    elif hold_within_tol.size:
-        hold_time_in_tolerance_ratio = float(np.mean(hold_within_tol))
-    else:
-        hold_time_in_tolerance_ratio = 0.0
-    hold_oscillation_count = float(_count_sign_changes(hold_errors, deadband=0.02 * base))
-    hold_mean_error_pct = 100.0 * abs(hold_mean_error) / base
-    hold_std_pct = 100.0 * math.sqrt(max(hold_variance, 0.0)) / base
-    hold_drift_pct = 100.0 * hold_drift / base
-    hold_tolerance_miss_pct = 100.0 * max(0.0, 1.0 - hold_time_in_tolerance_ratio)
-    hold_quality = (
-        3.0 * hold_mean_error_pct
-        + 2.0 * hold_tolerance_miss_pct
-        + 2.0 * hold_std_pct
-        + 1.5 * hold_drift_pct
-        + 4.0 * hold_oscillation_count
-    )
-    return {
-        "start_error": start_error,
-        "track_error": track_error,
-        "deviation": deviation,
-        "max_error": max_error,
-        "overshoot_pct": float(overshoot_pct),
-        "settling_time_s": float(settling_time_s) if settling_time_s is not None else math.nan,
-        "rise_time_s": float(rise_time_s) if rise_time_s is not None else math.nan,
-        "steady_state_error": steady_state_error,
-        "iae": float(iae),
-        "ise": float(ise),
-        "itae": float(itae),
-        "peak_value": peak_value,
-        "peak_time_s": peak_time_s,
-        "time_in_tolerance_s": time_in_tolerance_s,
-        "time_to_first_tolerance_s": time_to_first_tolerance_s,
-        "post_settle_variance": float(post_settle_variance),
-        "early_slope": float(early_features["early_slope"]),
-        "oscillation_count": float(oscillation_count),
-        "area_above_target": float(area_above_target),
-        "area_below_target": float(area_below_target),
-        "early_mean_error": float(early_features["early_mean_error"]),
-        "early_max_error": float(early_features["early_max_error"]),
-        "trace_duration_s": float(trace_duration_s),
-        "hold_duration_s": float(hold_duration_s),
-        "hold_mean_error": float(hold_mean_error),
-        "hold_variance": float(hold_variance),
-        "hold_drift": float(hold_drift),
-        "hold_time_in_tolerance_ratio": float(hold_time_in_tolerance_ratio),
-        "hold_oscillation_count": float(hold_oscillation_count),
-        "hold_quality": float(hold_quality),
-    }
-
-
-def aggregate_repeat_features(repeat_features: list[dict]) -> dict:
-    """Aggregate repeat-level trace features into candidate-level features."""
-    if not repeat_features:
-        return {
-            "feature_early_slope_mean": 0.0,
-            "feature_peak_value_mean": math.nan,
-            "feature_peak_time_s_mean": math.nan,
-            "feature_overshoot_pct_mean": 100.0,
-            "feature_time_to_first_tolerance_s_mean": math.nan,
-            "feature_time_in_tolerance_s_mean": 0.0,
-            "feature_oscillation_count_mean": 0.0,
-            "feature_area_above_target_mean": 0.0,
-            "feature_area_below_target_mean": 0.0,
-            "feature_post_settle_variance_mean": 999.0,
-            "feature_early_mean_error_mean": 999.0,
-            "feature_early_max_error_mean": 999.0,
-            "feature_hold_duration_s_mean": 0.0,
-            "feature_hold_mean_error_mean": 999.0,
-            "feature_hold_variance_mean": 999.0,
-            "feature_hold_drift_mean": 999.0,
-            "feature_hold_time_in_tolerance_ratio_mean": 0.0,
-            "feature_hold_oscillation_count_mean": 0.0,
-            "feature_hold_quality_mean": 999.0,
-            "feature_peak_value_std": 0.0,
-            "feature_overshoot_pct_std": 0.0,
-        }
-
-    def values(key: str) -> list[float]:
-        return [float(item[key]) for item in repeat_features if key in item and np.isfinite(float(item[key]))]
-
-    return {
-        "feature_early_slope_mean": _safe_mean(values("early_slope"), 0.0),
-        "feature_peak_value_mean": _safe_mean(values("peak_value"), math.nan),
-        "feature_peak_time_s_mean": _safe_mean(values("peak_time_s"), math.nan),
-        "feature_overshoot_pct_mean": _safe_mean(values("overshoot_pct"), 100.0),
-        "feature_time_to_first_tolerance_s_mean": _safe_mean(values("time_to_first_tolerance_s"), math.nan),
-        "feature_time_in_tolerance_s_mean": _safe_mean(values("time_in_tolerance_s"), 0.0),
-        "feature_oscillation_count_mean": _safe_mean(values("oscillation_count"), 0.0),
-        "feature_area_above_target_mean": _safe_mean(values("area_above_target"), 0.0),
-        "feature_area_below_target_mean": _safe_mean(values("area_below_target"), 0.0),
-        "feature_post_settle_variance_mean": _safe_mean(values("post_settle_variance"), 999.0),
-        "feature_early_mean_error_mean": _safe_mean(values("early_mean_error"), 999.0),
-        "feature_early_max_error_mean": _safe_mean(values("early_max_error"), 999.0),
-        "feature_hold_duration_s_mean": _safe_mean(values("hold_duration_s"), 0.0),
-        "feature_hold_mean_error_mean": _safe_mean(values("hold_mean_error"), 999.0),
-        "feature_hold_variance_mean": _safe_mean(values("hold_variance"), 999.0),
-        "feature_hold_drift_mean": _safe_mean(values("hold_drift"), 999.0),
-        "feature_hold_time_in_tolerance_ratio_mean": _safe_mean(values("hold_time_in_tolerance_ratio"), 0.0),
-        "feature_hold_oscillation_count_mean": _safe_mean(values("hold_oscillation_count"), 0.0),
-        "feature_hold_quality_mean": _safe_mean(values("hold_quality"), 999.0),
-        "feature_peak_value_std": _safe_std(values("peak_value"), 0.0),
-        "feature_overshoot_pct_std": _safe_std(values("overshoot_pct"), 0.0),
-    }
-
-
-def compute_trial_metrics(
-    per_test_powers: list[np.ndarray],
-    per_test_times: list[np.ndarray],
-    per_test_meta: list[dict],
-    desired_output: float,
-    *,
-    settled_window_samples: int = 5,
-):
-    """Convert repeated traces into aggregate control metrics and features."""
-    repeat_features: list[dict] = []
-    strict_bad_rates = []
-    oscillation_rates = []
-    invalid_flags = []
-    per_test_scores_unweighted = []
-
-    for readings, times, meta in zip(per_test_powers, per_test_times, per_test_meta):
-        features = extract_repeat_features(
-            times,
-            readings,
-            desired_output,
-            settled_window_samples=settled_window_samples,
-        )
-        repeat_features.append(features)
-        strict_bad_rates.append(float(meta.get("strict_bad_rate", 1.0)))
-        oscillation_rates.append(float(meta.get("oscillation_rate", 1.0)))
-        invalid_flags.append(1.0 if bool(meta.get("invalid", False)) else 0.0)
-        per_test_scores_unweighted.append(
-            features["track_error"]
-            + features["max_error"]
-            + features["overshoot_pct"]
-            + abs(features["steady_state_error"])
-            + features["iae"]
-            + strict_bad_rates[-1]
-            + oscillation_rates[-1]
-        )
-
-    metrics = {
-        "start_error": _safe_mean([f["start_error"] for f in repeat_features], 999.0),
-        "track_error": _safe_mean([f["track_error"] for f in repeat_features], 999.0),
-        "deviation": _safe_mean([f["deviation"] for f in repeat_features], 999.0),
-        "max_error": _safe_mean([f["max_error"] for f in repeat_features], 999.0),
-        "overshoot_pct": _safe_mean([f["overshoot_pct"] for f in repeat_features], 100.0),
-        "settling_time_s": _safe_mean([f["settling_time_s"] for f in repeat_features], 999.0),
-        "rise_time_s": _safe_mean([f["rise_time_s"] for f in repeat_features], 999.0),
-        "steady_state_error": _safe_mean([f["steady_state_error"] for f in repeat_features], 999.0),
-        "iae": _safe_mean([f["iae"] for f in repeat_features], 999.0),
-        "ise": _safe_mean([f["ise"] for f in repeat_features], 999.0),
-        "itae": _safe_mean([f["itae"] for f in repeat_features], 999.0),
-        "peak_value": _safe_mean([f["peak_value"] for f in repeat_features], math.nan),
-        "peak_time_s": _safe_mean([f["peak_time_s"] for f in repeat_features], 999.0),
-        "time_in_tolerance_s": _safe_mean([f["time_in_tolerance_s"] for f in repeat_features], 0.0),
-        "time_to_first_tolerance_s": _safe_mean([f["time_to_first_tolerance_s"] for f in repeat_features], 999.0),
-        "post_settle_variance": _safe_mean([f["post_settle_variance"] for f in repeat_features], 999.0),
-        "trace_duration_s": _safe_mean([f["trace_duration_s"] for f in repeat_features], 0.0),
-        "hold_duration_s": _safe_mean([f["hold_duration_s"] for f in repeat_features], 0.0),
-        "hold_mean_error": _safe_mean([f["hold_mean_error"] for f in repeat_features], 999.0),
-        "hold_variance": _safe_mean([f["hold_variance"] for f in repeat_features], 999.0),
-        "hold_drift": _safe_mean([f["hold_drift"] for f in repeat_features], 999.0),
-        "hold_time_in_tolerance_ratio": _safe_mean([f["hold_time_in_tolerance_ratio"] for f in repeat_features], 0.0),
-        "hold_oscillation_count": _safe_mean([f["hold_oscillation_count"] for f in repeat_features], 0.0),
-        "hold_quality": _safe_mean([f["hold_quality"] for f in repeat_features], 999.0),
-        "strict_bad_rate": _safe_mean(strict_bad_rates, 1.0),
-        "oscillation_rate": _safe_mean(oscillation_rates, 1.0),
-        "invalid_ratio": _safe_mean(invalid_flags, 1.0),
-        "repeatability": _safe_std(per_test_scores_unweighted, 999.0),
-    }
-    metrics.update(aggregate_repeat_features(repeat_features))
-    return metrics, repeat_features
-
-
-def score_single_repeat(readings: np.ndarray, meta: dict, desired_output: float) -> float:
-    """Score one repeat quickly so unstable candidates can be stopped early."""
-    if readings.size == 0:
-        return 999.0
-
-    start_power = float(readings[0])
-    abs_error = np.abs(readings - desired_output)
-    start_error = abs(start_power - desired_output)
-    track_error = float(np.mean(abs_error))
-    deviation = float(np.std(readings))
-    max_error = float(np.max(abs_error))
-    strict_bad_rate = float(meta.get("strict_bad_rate", 1.0))
-    oscillation_rate = float(meta.get("oscillation_rate", 1.0))
-    hold_error = float(np.mean(readings[-max(5, readings.size // 3) :]) - desired_output)
-    hold_variance = float(np.var(readings[-max(5, readings.size // 3) :]))
-    return (
-        0.25 * start_error
-        + 0.50 * track_error
-        + 0.75 * deviation
-        + 0.75 * max_error
-        + 2.0 * abs(hold_error)
-        + 1.5 * hold_variance
-        + 3.0 * strict_bad_rate
-        + 4.0 * oscillation_rate
-    )
-
-
-class OnlineSurrogateModel:
-    """Small refit-on-update surrogate wrapper for embedded-friendly tuning."""
-
-    def __init__(self, model_name: str, *, random_state: int = 42):
-        self.model_name = str(model_name)
-        self.random_state = int(random_state)
-        self.model = None
-        self.is_available = False
-        self.last_error = ""
-        self.last_fit_count = 0
-
-    def _build_model(self):
-        if not HAVE_SKLEARN or self.model_name == "none":
-            raise RuntimeError("scikit-learn unavailable")
-        if self.model_name == "random_forest":
-            return RandomForestRegressor(
-                n_estimators=48,
-                max_depth=10,
-                min_samples_leaf=2,
-                random_state=self.random_state,
-            )
-        return ExtraTreesRegressor(
-            n_estimators=48,
-            max_depth=10,
-            min_samples_leaf=2,
-            random_state=self.random_state,
-        )
-
-    def fit(self, rows: list[dict], *, min_samples: int) -> bool:
-        usable = [row for row in rows if np.isfinite(float(row.get("score", math.inf)))]
-        if len(usable) < int(min_samples):
-            self.is_available = False
-            self.model = None
-            self.last_fit_count = len(usable)
-            return False
-        try:
-            x = np.asarray(
-                [[float(row[name]) for name in SURROGATE_FEATURE_NAMES] for row in usable],
-                dtype=float,
-            )
-            y = np.asarray([float(row["score"]) for row in usable], dtype=float)
-            self.model = self._build_model()
-            self.model.fit(x, y)
-            self.is_available = True
-            self.last_error = ""
-            self.last_fit_count = len(usable)
-            return True
-        except Exception as exc:
-            self.model = None
-            self.is_available = False
-            self.last_error = str(exc)
-            self.last_fit_count = len(usable)
-            return False
-
-    def predict(self, candidates: list[tuple[float, float, float]], *, desired_output: float, frequency_khz: int) -> list[float]:
-        if not self.is_available or self.model is None or not candidates:
-            return [math.nan for _ in candidates]
-        x = np.asarray(
-            [
-                [float(kp), float(ki), float(kd), float(desired_output), float(frequency_khz)]
-                for kp, ki, kd in candidates
-            ],
-            dtype=float,
-        )
-        try:
-            preds = self.model.predict(x)
-            return [float(v) for v in preds]
-        except Exception as exc:
-            self.is_available = False
-            self.last_error = str(exc)
-            return [math.nan for _ in candidates]
-
-
-def build_surrogate_training_row(
-    kp: float,
-    ki: float,
-    kd: float,
-    *,
-    desired_output: float,
-    frequency_khz: int,
-    score: float,
-) -> dict:
-    return {
-        "kp": float(kp),
-        "ki": float(ki),
-        "kd": float(kd),
-        "desired_output": float(desired_output),
-        "frequency_khz": float(frequency_khz),
-        "score": float(score),
-    }
-
-
-def propose_surrogate_candidate(
-    surrogate: OnlineSurrogateModel,
-    *,
-    best_pid: tuple[float, float, float] | None,
-    safe_points: list[tuple[float, float, float]],
-    observed_points: list[tuple[float, float, float]],
-    desired_output: float,
-    frequency_khz: int,
-    rng: random.Random,
-    pool_size: int,
-    explore_prob: float,
-    jitter_scale: float,
-    step_kp: float,
-    step_ki: float,
-    step_kd: float,
-    kp_max: float,
-    ki_max: float,
-    kd_max: float,
-) -> tuple[tuple[float, float, float], float, str]:
-    """Generate a bounded candidate pool and score it with the surrogate."""
-    center = best_pid or (0.5 * kp_max, 0.5 * ki_max, 0.5 * kd_max)
-    spans = np.asarray([max(step_kp, 1e-3), max(step_ki, 1e-3), max(step_kd, 1e-3)], dtype=float)
-    candidates: list[tuple[float, float, float]] = []
-
-    if safe_points:
-        for point in safe_points[-min(6, len(safe_points)) :]:
-            candidates.append(tuple(float(v) for v in point))
-
-    for _ in range(max(8, int(pool_size))):
-        if rng.random() < 0.5 and best_pid is not None:
-            base = np.asarray(center, dtype=float)
-        elif safe_points:
-            base = np.asarray(rng.choice(safe_points), dtype=float)
-        else:
-            base = np.asarray(center, dtype=float)
-        noise = np.asarray(
-            [
-                rng.uniform(-1.0, 1.0) * spans[0] * float(jitter_scale),
-                rng.uniform(-1.0, 1.0) * spans[1] * float(jitter_scale),
-                rng.uniform(-1.0, 1.0) * spans[2] * float(jitter_scale),
-            ],
-            dtype=float,
-        )
-        proposal = np.clip(base + noise, [0.0, 0.0, 0.0], [kp_max, ki_max, kd_max])
-        candidates.append((float(proposal[0]), float(proposal[1]), float(proposal[2])))
-
-    deduped: list[tuple[float, float, float]] = []
-    seen = set()
-    observed_rounded = {tuple(round(v, 6) for v in point) for point in observed_points}
-    for candidate in candidates:
-        rounded = tuple(round(v, 6) for v in candidate)
-        if rounded in seen or rounded in observed_rounded:
-            continue
-        seen.add(rounded)
-        deduped.append(candidate)
-
-    if not deduped:
-        deduped = [tuple(float(v) for v in center)]
-
-    predictions = surrogate.predict(
-        deduped,
-        desired_output=desired_output,
-        frequency_khz=frequency_khz,
-    )
-    ranked = sorted(zip(deduped, predictions), key=lambda item: item[1] if np.isfinite(item[1]) else float("inf"))
-    if rng.random() < float(explore_prob) and len(ranked) > 1:
-        choice = rng.choice(ranked[: min(4, len(ranked))] + ranked[-min(3, len(ranked)) :])
-        return choice[0], float(choice[1]), "surrogate_explore"
-    best_candidate, best_pred = ranked[0]
-    return best_candidate, float(best_pred), "surrogate"
-
-
-def score_controller(
-    metrics: dict,
-    *,
-    w_start: float,
-    w_track: float,
-    w_dev: float,
-    w_max: float,
-    w_repeat: float,
-    w_strict: float,
-    w_osc: float,
-    w_overshoot: float,
-    w_settle: float,
-    w_rise: float,
-    w_steady: float,
-    w_iae: float,
-    w_ise: float,
-    w_tolerance_time: float,
-    w_post_var: float,
-    w_hold: float,
-    invalid_penalty: float,
-    cancelled_candidate: bool,
-    aborted: bool,
-):
-    """Combine control metrics into one scalar score (lower is better)."""
-    hold_ratio = float(metrics.get("hold_time_in_tolerance_ratio", 0.0))
-    track_discount = 0.25 if hold_ratio >= 0.80 else (0.50 if hold_ratio >= 0.50 else 1.0)
-    score = (
-        w_start * float(metrics["start_error"])
-        + w_track * float(metrics["track_error"]) * track_discount
-        + w_dev * float(metrics["deviation"])
-        + w_max * float(metrics["max_error"])
-        + w_repeat * float(metrics["repeatability"])
-        + w_strict * float(metrics["strict_bad_rate"])
-        + w_osc * float(metrics["oscillation_rate"])
-        + w_overshoot * float(metrics["overshoot_pct"])
-        + w_settle * float(metrics["settling_time_s"])
-        + w_rise * float(metrics["rise_time_s"])
-        + w_steady * abs(float(metrics["steady_state_error"]))
-        + w_iae * float(metrics["iae"])
-        + w_ise * float(metrics["ise"])
-        + w_post_var * float(metrics["post_settle_variance"])
-        + w_hold * float(metrics.get("hold_quality", 999.0))
-        - w_tolerance_time * float(metrics["time_in_tolerance_s"])
-        + invalid_penalty * float(metrics["invalid_ratio"])
-    )
-    if hold_ratio < 0.60:
-        score += (0.60 - hold_ratio) * 300.0
-    if float(metrics.get("hold_oscillation_count", 0.0)) >= 2.0:
-        score += 120.0
-    if float(metrics.get("hold_drift", 0.0)) > max(abs(float(metrics.get("steady_state_error", 0.0))), 1.0):
-        score += 80.0
-    if cancelled_candidate:
-        score += 250.0
-    if aborted:
-        score += 500.0
-    if float(metrics.get("invalid_ratio", 0.0)) >= 0.5:
-        score += 200.0
-    if float(metrics.get("oscillation_rate", 0.0)) >= 0.5:
-        score += 150.0
-    return float(score)
-
-
-def propose_coordinate_candidate(
-    base_pid: tuple[float, float, float],
-    axis_index: int,
-    axis_direction: float,
-    *,
-    step_kp: float,
-    step_ki: float,
-    step_kd: float,
-    kp_max: float,
-    ki_max: float,
-    kd_max: float,
-) -> tuple[tuple[float, float, float], int, float, float]:
-    """Adjust exactly one PID term from the current base point."""
-    values = [float(base_pid[0]), float(base_pid[1]), float(base_pid[2])]
-    step_sizes = [float(step_kp), float(step_ki), float(step_kd)]
-    max_values = [float(kp_max), float(ki_max), float(kd_max)]
-
-    used_axis = int(axis_index) % 3
-    direction = 1.0 if axis_direction >= 0 else -1.0
-    delta = direction * step_sizes[used_axis]
-    proposed_value = float(np.clip(values[used_axis] + delta, 0.0, max_values[used_axis]))
-
-    if np.isclose(proposed_value, values[used_axis]):
-        direction *= -1.0
-        delta = direction * step_sizes[used_axis]
-        proposed_value = float(np.clip(values[used_axis] + delta, 0.0, max_values[used_axis]))
-
-    values[used_axis] = proposed_value
-    actual_delta = values[used_axis] - base_pid[used_axis]
-    return (values[0], values[1], values[2]), used_axis, direction, float(actual_delta)
-
-
-def candidate_is_safe(
-    metrics: dict,
-    *,
-    cancelled_candidate: bool,
-    aborted: bool,
-    max_invalid_ratio: float,
-    max_oscillation_rate: float,
-) -> bool:
-    """Gate Bayesian search until the warmup has produced stable candidates."""
-    if cancelled_candidate or aborted:
-        return False
-    if float(metrics.get("invalid_ratio", 1.0)) > max_invalid_ratio:
-        return False
-    if float(metrics.get("oscillation_rate", 1.0)) > max_oscillation_rate:
-        return False
-    return True
-
-
-def candidate_is_good(
-    metrics: dict,
-    score: float,
-    *,
-    cancelled_candidate: bool,
-    aborted: bool,
-    baseline_score: float | None,
-    max_invalid_ratio: float,
-    max_oscillation_rate: float,
-    max_score_factor: float,
-) -> bool:
-    """Require stability plus a score near or better than the baseline."""
-    if not candidate_is_safe(
-        metrics,
-        cancelled_candidate=cancelled_candidate,
-        aborted=aborted,
-        max_invalid_ratio=max_invalid_ratio,
-        max_oscillation_rate=max_oscillation_rate,
-    ):
-        return False
-    if baseline_score is None or baseline_score <= 0:
-        return True
-    return float(score) <= (float(baseline_score) * float(max_score_factor))
-
-
-def compute_bootstrap_axis_status(
-    safe_points: list[tuple[float, float, float]],
-    *,
-    min_points_per_axis: int,
-    min_span_kp: float,
-    min_span_ki: float,
-    min_span_kd: float,
-) -> list[dict]:
-    """Summarise bootstrap coverage progress separately for each PID axis."""
-    required_spans = (float(min_span_kp), float(min_span_ki), float(min_span_kd))
-    if not safe_points:
-        return [
-            {
-                "axis_index": idx,
-                "axis_name": AXIS_NAMES[idx],
-                "distinct_safe_values": 0,
-                "safe_span": 0.0,
-                "required_distinct_values": int(min_points_per_axis),
-                "required_safe_span": float(required_spans[idx]),
-                "distinct_deficit": int(min_points_per_axis),
-                "span_deficit": float(required_spans[idx]),
-                "distinct_coverage": 0.0,
-                "span_coverage": 0.0,
-                "deficit_score": float(int(min_points_per_axis) + 1.0),
-                "coverage_ratio": 0.0,
-                "bootstrap_complete": False,
-                "complete": False,
-            }
-            for idx in range(3)
-        ]
-
-    safe_arr = np.asarray(safe_points, dtype=float)
-    statuses: list[dict] = []
-    for idx, required_span in enumerate(required_spans):
-        axis_values = np.round(safe_arr[:, idx], 6)
-        distinct_safe_values = int(len(np.unique(axis_values)))
-        safe_span = float(np.max(safe_arr[:, idx]) - np.min(safe_arr[:, idx])) if safe_arr.size else 0.0
-        distinct_deficit = max(0, int(min_points_per_axis) - distinct_safe_values)
-        span_deficit = max(0.0, float(required_span) - safe_span)
-        distinct_ratio = (
-            min(1.0, distinct_safe_values / float(max(1, int(min_points_per_axis))))
-            if int(min_points_per_axis) > 0
-            else 1.0
-        )
-        span_ratio = min(1.0, safe_span / float(max(required_span, 1e-9))) if required_span > 0 else 1.0
-        coverage_ratio = min(distinct_ratio, span_ratio)
-        bootstrap_complete = bool(distinct_deficit == 0 and span_deficit <= 1e-9)
-        deficit_score = float(distinct_deficit) + (float(span_deficit) / float(max(required_span, 1e-9)))
-        statuses.append(
-            {
-                "axis_index": idx,
-                "axis_name": AXIS_NAMES[idx],
-                "distinct_safe_values": distinct_safe_values,
-                "safe_span": safe_span,
-                "required_distinct_values": int(min_points_per_axis),
-                "required_safe_span": float(required_span),
-                "distinct_deficit": distinct_deficit,
-                "span_deficit": span_deficit,
-                "distinct_coverage": float(distinct_ratio),
-                "span_coverage": float(span_ratio),
-                "deficit_score": float(deficit_score),
-                "coverage_ratio": float(coverage_ratio),
-                "bootstrap_complete": bootstrap_complete,
-                "complete": bootstrap_complete,
-            }
-        )
-    return statuses
-
-
-def bootstrap_axes_complete(axis_statuses: list[dict]) -> bool:
-    """Return True when every PID axis has met bootstrap safe-coverage requirements."""
-    return bool(axis_statuses) and all(bool(status.get("bootstrap_complete", False)) for status in axis_statuses)
-
-
-def find_blocking_bootstrap_axis(axis_statuses: list[dict]) -> dict | None:
-    """Return the incomplete axis with the largest remaining bootstrap deficit."""
-    incomplete_axes = [
-        status
-        for status in axis_statuses
-        if not bool(status.get("bootstrap_complete", status.get("complete", False)))
-    ]
-    if not incomplete_axes:
-        return None
-
-    return max(
-        incomplete_axes,
-        key=lambda status: (
-            float(status.get("deficit_score", 0.0)),
-            -float(status.get("coverage_ratio", 0.0)),
-            -float(status.get("span_coverage", 0.0)),
-            -int(status.get("axis_index", 0)),
-        ),
-    )
-
-
-def choose_bootstrap_axis(
-    base_pid: tuple[float, float, float],
-    *,
-    safe_points: list[tuple[float, float, float]],
-    axis_directions: list[float],
-    preferred_axis_index: int,
-    step_kp: float,
-    step_ki: float,
-    step_kd: float,
-    kp_max: float,
-    ki_max: float,
-    kd_max: float,
-    min_points_per_axis: int,
-    min_span_kp: float,
-    min_span_ki: float,
-    min_span_kd: float,
-) -> tuple[int, list[dict]]:
-    """Choose the next bootstrap axis, preferring incomplete coverage first."""
-    axis_statuses = compute_bootstrap_axis_status(
-        safe_points,
-        min_points_per_axis=min_points_per_axis,
-        min_span_kp=min_span_kp,
-        min_span_ki=min_span_ki,
-        min_span_kd=min_span_kd,
-    )
-
-    probeable_axes: list[tuple[dict, bool]] = []
-    for status in axis_statuses:
-        candidate, _, _, actual_delta = propose_coordinate_candidate(
-            base_pid,
-            axis_index=status["axis_index"],
-            axis_direction=axis_directions[status["axis_index"] % 3],
-            step_kp=step_kp,
-            step_ki=step_ki,
-            step_kd=step_kd,
-            kp_max=kp_max,
-            ki_max=ki_max,
-            kd_max=kd_max,
-        )
-        _ = candidate
-        if abs(float(actual_delta)) > 1e-9:
-            probeable_axes.append(
-                (status, int(status["axis_index"]) == (int(preferred_axis_index) % 3))
-            )
-
-    if not probeable_axes:
-        return int(preferred_axis_index) % 3, axis_statuses
-
-    blocking_axis = find_blocking_bootstrap_axis(axis_statuses)
-    incomplete_axes = [
-        (status, is_preferred_axis)
-        for status, is_preferred_axis in probeable_axes
-        if not bool(status.get("bootstrap_complete", status.get("complete", False)))
-    ]
-    ranked_axes = incomplete_axes if incomplete_axes else probeable_axes
-
-    def rank_key(item: tuple[dict, bool]) -> tuple[float, float, float, int, int]:
-        status, is_preferred_axis = item
-        return (
-            0 if (
-                blocking_axis is not None
-                and int(status.get("axis_index", -1)) == int(blocking_axis.get("axis_index", -2))
-            ) else 1,
-            -float(status.get("deficit_score", 0.0)),
-            float(status.get("coverage_ratio", 1.0)),
-            float(status.get("span_coverage", 1.0)),
-            0 if is_preferred_axis else 1,
-            int(status["axis_index"]),
-        )
-
-    ranked_axes.sort(key=rank_key)
-    return int(ranked_axes[0][0]["axis_index"]), axis_statuses
-
-
-def assess_bayes_region(
-    safe_points: list[tuple[float, float, float]],
-    good_points: list[tuple[float, float, float]],
-    *,
-    min_safe_candidates: int,
-    min_points_per_axis: int,
-    min_good_candidates: int,
-    min_span_kp: float,
-    min_span_ki: float,
-    min_span_kd: float,
-) -> dict:
-    """Decide whether the warmup has mapped a usable local region for BO."""
-    axis_statuses = compute_bootstrap_axis_status(
-        safe_points,
-        min_points_per_axis=min_points_per_axis,
-        min_span_kp=min_span_kp,
-        min_span_ki=min_span_ki,
-        min_span_kd=min_span_kd,
-    )
-    if not safe_points:
-        return {
-            "ready": False,
-            "reason": "no safe candidates yet",
-            "unique_counts": (0, 0, 0),
-            "spans": (0.0, 0.0, 0.0),
-            "axis_statuses": axis_statuses,
-            "blocking_axis": None,
-        }
-
-    unique_counts = tuple(int(status["distinct_safe_values"]) for status in axis_statuses)
-    spans = tuple(float(status["safe_span"]) for status in axis_statuses)
-    if len(safe_points) < int(min_safe_candidates):
-        return {
-            "ready": False,
-            "reason": f"only {len(safe_points)} safe candidates",
-            "unique_counts": unique_counts,
-            "spans": spans,
-            "axis_statuses": axis_statuses,
-            "blocking_axis": None,
-        }
-
-    if len(good_points) < int(min_good_candidates):
-        return {
-            "ready": False,
-            "reason": f"only {len(good_points)} good candidates",
-            "unique_counts": unique_counts,
-            "spans": spans,
-            "axis_statuses": axis_statuses,
-            "blocking_axis": None,
-        }
-
-    if not bootstrap_axes_complete(axis_statuses):
-        incomplete_status = find_blocking_bootstrap_axis(axis_statuses)
-        if incomplete_status is not None:
-            return {
-                "ready": False,
-                "reason": (
-                    f"{incomplete_status['axis_name']} coverage "
-                    f"{incomplete_status['distinct_safe_values']}/{incomplete_status['required_distinct_values']} "
-                    f"| span {incomplete_status['safe_span']:.4f}/{incomplete_status['required_safe_span']:.4f}"
-                ),
-                "unique_counts": unique_counts,
-                "spans": spans,
-                "axis_statuses": axis_statuses,
-                "blocking_axis": str(incomplete_status["axis_name"]).upper(),
-            }
-
-    return {
-        "ready": True,
-        "reason": "safe local region established",
-        "unique_counts": unique_counts,
-        "spans": spans,
-        "axis_statuses": axis_statuses,
-        "blocking_axis": None,
-    }
-
-
-def assess_bootstrap_progress(
-    *,
-    bootstrap_trials_done: int,
-    bootstrap_trials_minimum: int,
-    max_bootstrap_trials: int,
-    region_status: dict,
-) -> dict:
-    """Combine minimum-trial gating with safe-region readiness for bootstrap control."""
-    minimum_required = max(1, int(bootstrap_trials_minimum))
-    hard_cap = max(minimum_required, int(max_bootstrap_trials))
-    minimum_reached = int(bootstrap_trials_done) >= minimum_required
-    region_ready = bool(region_status.get("ready", False))
-    ready = False
-
-    if minimum_reached and region_ready:
-        ready = True
-        reason = "minimum bootstrap target reached and safe region is ready"
-    elif not minimum_reached:
-        reason = f"minimum bootstrap target not reached yet ({int(bootstrap_trials_done)}/{minimum_required})"
-    else:
-        reason = str(region_status.get("reason", "safe region not ready yet"))
-
-    return {
-        "ready": ready if minimum_reached and region_ready else False,
-        "reason": reason,
-        "minimum_required": minimum_required,
-        "minimum_reached": minimum_reached,
-        "hard_cap": hard_cap,
-        "blocking_axis": region_status.get("blocking_axis"),
-        "region_ready": region_ready,
-    }
-
-
-def build_bayes_search_space(
-    safe_pids: list[tuple[float, float, float]],
-    *,
-    kp_max: float,
-    ki_max: float,
-    kd_max: float,
-    pad_kp: float,
-    pad_ki: float,
-    pad_kd: float,
-) -> list[BayesSpaceDim]:
-    """Build a local Bayesian search box around the safe region from coordinate search."""
-    if not safe_pids:
-        return [
-            Real(0.0, kp_max, name="kp"),
-            Real(0.0, ki_max, name="ki"),
-            Real(0.0, kd_max, name="kd"),
-        ]
-
-    mins = np.min(np.asarray(safe_pids, dtype=float), axis=0)
-    maxs = np.max(np.asarray(safe_pids, dtype=float), axis=0)
-    pads = np.asarray([pad_kp, pad_ki, pad_kd], dtype=float)
-    bounds_max = np.asarray([kp_max, ki_max, kd_max], dtype=float)
-    lower = np.clip(mins - pads, 0.0, bounds_max)
-    upper = np.clip(maxs + pads, 0.0, bounds_max)
-
-    for idx in range(3):
-        if upper[idx] <= lower[idx]:
-            upper[idx] = min(bounds_max[idx], lower[idx] + max(pads[idx], 1e-3))
-            lower[idx] = max(0.0, upper[idx] - max(pads[idx], 1e-3))
-
-    return [
-        Real(float(lower[0]), float(upper[0]), name="kp"),
-        Real(float(lower[1]), float(upper[1]), name="ki"),
-        Real(float(lower[2]), float(upper[2]), name="kd"),
-    ]
-
-
-def filter_seed_points_for_space(
-    points: list[tuple[float, float, float]],
-    scores: list[float],
-    space: list[BayesSpaceDim],
-) -> tuple[list[list[float]], list[float]]:
-    """Keep only warmup observations that fit inside the Bayesian local box."""
-    filtered_points: list[list[float]] = []
-    filtered_scores: list[float] = []
-    for point, score in zip(points, scores):
-        if all(dim.low <= value <= dim.high for dim, value in zip(space, point)):
-            filtered_points.append([float(point[0]), float(point[1]), float(point[2])])
-            filtered_scores.append(float(score))
-    return filtered_points, filtered_scores
-
-
 def format_readiness_status(
     *,
     bootstrap_status: dict | None,
@@ -1674,65 +202,71 @@ def format_readiness_status(
     safe_target: int,
     good_count: int,
     good_target: int,
-    unique_counts: tuple[int, int, int],
-    per_axis_target: int,
-    spans: tuple[float, float, float],
-    span_targets: tuple[float, float, float],
     warmup_trials_done: int | None = None,
 ) -> str:
-    """Build a short GUI checklist for post-warmup optimisation readiness."""
+    """Build a short GUI checklist for bootstrap readiness."""
+
     def mark(done: bool) -> str:
         return "[x]" if done else "[ ]"
 
-    axis_statuses = list(region_status.get("axis_statuses", []))
-
-    def format_axis_line(status: dict) -> str:
-        axis_name = str(status.get("axis_name", "?")).capitalize()
-        if bool(status.get("bootstrap_complete", status.get("complete", False))):
-            return f"{axis_name} coverage: complete"
-        return (
-            f"{axis_name} coverage: "
-            f"{int(status.get('distinct_safe_values', 0))}/{int(status.get('required_distinct_values', 0))}, "
-            f"span {float(status.get('safe_span', 0.0)):.3f}/{float(status.get('required_safe_span', 0.0)):.3f}"
-        )
-
-    bootstrap_line = "Bootstrap progress: waiting for first trial"
+    bootstrap_line = "Bootstrap: searching for stable local region"
     if bootstrap_status is not None:
-        minimum_state = "reached" if bool(bootstrap_status.get("minimum_reached")) else "not yet reached"
         bootstrap_line = (
             f"Bootstrap: {int(warmup_trials_done or 0)} trials run | "
-            f"minimum {int(bootstrap_status.get('minimum_required', 0))} {minimum_state} | "
+            f"floor {int(bootstrap_status.get('minimum_required', 0))} "
+            f"{'reached' if bool(bootstrap_status.get('minimum_reached')) else 'not yet reached'} | "
             f"cap {int(bootstrap_status.get('hard_cap', 0))}"
         )
 
-    if bool(bootstrap_status and bootstrap_status.get("ready")):
-        tail = "Blocking axis: none"
-        summary = "Safe region ready. Switching to counted optimisation."
+    center_pid = region_status.get("center_pid")
+    if center_pid is None:
+        center_text = "Local centre: waiting for best candidate"
     else:
-        blocking_axis = None
-        if bootstrap_status is not None:
-            blocking_axis = bootstrap_status.get("blocking_axis")
-        tail = f"Blocking axis: {blocking_axis if blocking_axis else 'None'}"
-        summary = f"Blocked by: {bootstrap_status['reason'] if bootstrap_status is not None else region_status['reason']}"
+        center_text = (
+            "Local centre: "
+            f"Kp={center_pid[0]:.4f}, Ki={center_pid[1]:.4f}, Kd={center_pid[2]:.4f}"
+        )
+
+    local_safe = int(region_status.get("local_safe_count", 0))
+    local_good = int(region_status.get("local_good_count", 0))
+    local_unsafe = int(region_status.get("local_unsafe_count", 0))
+    local_variation_axes = int(region_status.get("local_variation_axes", 0))
+    local_spans = tuple(region_status.get("local_spans", (0.0, 0.0, 0.0)))
+    local_counts = tuple(region_status.get("local_unique_counts", (0, 0, 0)))
 
     lines = [
         "Bootstrap readiness:",
         bootstrap_line,
-        f"{mark(safe_count >= safe_target)} Safe candidates: {safe_count}/{safe_target}\n"
+        f"{mark(safe_count >= safe_target)} Safe candidates: {safe_count}/{safe_target}",
         f"{mark(good_count >= good_target)} Good candidates: {good_count}/{good_target}",
+        center_text,
+        (
+            "Local region: "
+            f"safe={local_safe}, good={local_good}, unstable={local_unsafe}, "
+            f"axes_with_variation={local_variation_axes}/3"
+        ),
+        (
+            "Local spread: "
+            f"Kp {local_counts[0]} pts / {local_spans[0]:.4f}, "
+            f"Ki {local_counts[1]} pts / {local_spans[1]:.4f}, "
+            f"Kd {local_counts[2]} pts / {local_spans[2]:.4f}"
+        ),
     ]
+
+    axis_statuses = list(region_status.get("axis_statuses", []))
     if axis_statuses:
-        lines.extend(format_axis_line(status) for status in axis_statuses)
+        lines.append("Secondary diagnostic:")
+        for status in axis_statuses:
+            lines.append(
+                f"{str(status.get('axis_name', '?')).upper()} global safe spread "
+                f"{int(status.get('distinct_safe_values', 0))}/{int(status.get('required_distinct_values', 0))}, "
+                f"span {float(status.get('safe_span', 0.0)):.4f}/{float(status.get('required_safe_span', 0.0)):.4f}"
+            )
+
+    if bool(bootstrap_status and bootstrap_status.get("ready")):
+        lines.append("Bootstrap complete: switching to optimisation")
     else:
-        lines.extend(
-            [
-                f"Kp coverage: {unique_counts[0]}/{per_axis_target}, span {spans[0]:.3f}/{span_targets[0]:.3f}",
-                f"Ki coverage: {unique_counts[1]}/{per_axis_target}, span {spans[1]:.3f}/{span_targets[1]:.3f}",
-                f"Kd coverage: {unique_counts[2]}/{per_axis_target}, span {spans[2]:.3f}/{span_targets[2]:.3f}",
-            ]
-        )
-    lines.append(tail)
-    lines.append(summary)
+        lines.append(str(region_status.get("reason", "Bootstrap: searching for stable local region")))
     return "\n".join(lines)
 
 
@@ -1742,13 +276,13 @@ def format_warmup_change_message(
     used_axis: int | None,
     candidate_delta: float,
 ) -> str:
-    """Describe the current warmup move for the monitor."""
+    """Describe the current bootstrap move for the monitor."""
     if candidate_pid is None:
-        return "Warmup change: waiting for first candidate"
+        return "Bootstrap change: waiting for first candidate"
     if base_pid is None or used_axis is None:
-        return "Warmup change: baseline trial using current hardware PID (no warmup delta)"
+        return "Bootstrap change: baseline trial using current hardware PID"
     return (
-        "Warmup change: "
+        "Bootstrap change: "
         f"base=({base_pid[0]:.4f}, {base_pid[1]:.4f}, {base_pid[2]:.4f}) -> "
         f"{AXIS_NAMES[used_axis]} {candidate_delta:+.4f} -> "
         f"candidate=({candidate_pid[0]:.4f}, {candidate_pid[1]:.4f}, {candidate_pid[2]:.4f})"
@@ -1768,27 +302,16 @@ def format_previous_warmup_result_message(
     safe_oscillation_rate: float,
     good_score_factor: float,
 ) -> str:
-    """Summarise whether the last warmup candidate passed and why it failed if not."""
+    """Summarise whether the last bootstrap candidate passed and why it failed."""
     reasons: list[str] = []
-
     if cancelled_candidate:
         reasons.append(cancel_reason or "remaining repeats cancelled")
     if aborted:
         reasons.append("trial aborted by safety condition")
 
-    per_repeat_reasons = []
-    for meta in per_test_meta:
-        reason = str(meta.get("reason", "")).strip()
-        if reason:
-            per_repeat_reasons.append(reason)
-    primary_repeat_reason = list(dict.fromkeys(per_repeat_reasons))[0] if per_repeat_reasons else ""
-
     invalid_ratio = float(metrics.get("invalid_ratio", 0.0))
     if invalid_ratio > float(safe_invalid_ratio):
-        detail = f"invalid ratio {invalid_ratio:.2f} > {float(safe_invalid_ratio):.2f}"
-        if primary_repeat_reason:
-            detail = f"{detail} ({primary_repeat_reason})"
-        reasons.append(detail)
+        reasons.append(f"invalid ratio {invalid_ratio:.2f} > {float(safe_invalid_ratio):.2f}")
 
     oscillation_rate = float(metrics.get("oscillation_rate", 0.0))
     if oscillation_rate > float(safe_oscillation_rate):
@@ -1799,17 +322,26 @@ def format_previous_warmup_result_message(
         if score > good_limit:
             reasons.append(f"score {score:.2f} > good threshold {good_limit:.2f}")
 
+    tolerated = []
+    for idx, meta in enumerate(per_test_meta, start=1):
+        cats = list(meta.get("failure_categories", []))
+        if cats and not meta.get("cancellation_decision"):
+            tolerated.append(f"repeat {idx}: {', '.join(cats)} tolerated")
     if reasons:
-        return "Previous warmup result: failed - " + "; ".join(reasons)
+        if tolerated:
+            reasons.append("; ".join(tolerated[:2]))
+        return "Previous bootstrap result: blocked - " + "; ".join(reasons)
 
+    suffix = ""
+    if tolerated:
+        suffix = f" | {'; '.join(tolerated[:2])}"
     return (
-        "Previous warmup result: passed - "
-        f"score={score:.2f}, invalid={invalid_ratio:.2f}, osc={oscillation_rate:.2f}"
+        "Previous bootstrap result: usable - "
+        f"score={score:.2f}, invalid={invalid_ratio:.2f}, osc={oscillation_rate:.2f}{suffix}"
     )
 
 
 def format_phase_display(mode: str) -> str:
-    """Format a concise, prominent phase label for the runtime monitor."""
     if mode == "validation":
         return "VALIDATION"
     if mode.startswith("surrogate"):
@@ -1822,7 +354,6 @@ def format_phase_display(mode: str) -> str:
 
 
 def format_candidate_source(mode: str) -> str:
-    """Format the current candidate source label for the runtime monitor."""
     if mode.startswith("surrogate"):
         return "surrogate"
     if mode == "bo":
@@ -1833,7 +364,6 @@ def format_candidate_source(mode: str) -> str:
 
 
 def counted_trial_totals(*, mode: str, n_trials: int, validation_trials: int) -> tuple[int | None, int, int, int]:
-    """Return upcoming phase labels and split counters for the monitor."""
     if mode == "validation":
         return int(validation_trials), 0, 0, 1
     if mode == "warmup":
@@ -1841,11 +371,9 @@ def counted_trial_totals(*, mode: str, n_trials: int, validation_trials: int) ->
     return int(n_trials), 0, 1, 0
 
 
-def main():
-    """Parse inputs, run selected action, and manage full tuning workflow."""
+def main() -> None:
     import argparse
 
-    # Runtime arguments for serial connection, tuning bounds, and target output.
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
     ap.add_argument("--baud", type=int, default=115200)
@@ -1890,73 +418,58 @@ def main():
         "--max-bootstrap-trials",
         type=int,
         default=27,
-        help="Hard cap on bootstrap safe-range discovery trials; these do not count toward --iters",
+        help="Hard cap on bootstrap local-region discovery trials; these do not count toward --iters",
     )
     ap.add_argument(
         "--bayes-min-safe-trials",
         type=int,
         default=4,
-        help="Minimum number of safe warmup trials required before Bayesian optimisation starts",
+        help="Minimum number of safe bootstrap trials required before optimisation starts",
     )
     ap.add_argument(
         "--bayes-region-min-points-per-axis",
         type=int,
         default=3,
-        help="Minimum number of distinct safe values required on each PID axis before Bayesian optimisation starts",
+        help="Diagnostic target for distinct safe values per PID axis during bootstrap",
     )
     ap.add_argument(
         "--bayes-region-min-good-candidates",
         type=int,
         default=2,
-        help="Minimum number of stable, reasonably accurate warmup candidates required before Bayesian optimisation starts",
+        help="Minimum number of stable, target-holding bootstrap candidates required before optimisation starts",
     )
     ap.add_argument(
         "--bayes-region-good-score-factor",
         type=float,
         default=1.05,
-        help="Warmup candidate counts as good if its score is at most this multiple of the baseline score",
+        help="Bootstrap candidate counts as good if its score is at most this multiple of the baseline score",
     )
-    ap.add_argument(
-        "--bayes-region-min-span-kp",
-        type=float,
-        default=0.05,
-        help="Minimum safe Kp span required before Bayesian optimisation starts",
-    )
-    ap.add_argument(
-        "--bayes-region-min-span-ki",
-        type=float,
-        default=0.05,
-        help="Minimum safe Ki span required before Bayesian optimisation starts",
-    )
-    ap.add_argument(
-        "--bayes-region-min-span-kd",
-        type=float,
-        default=0.01,
-        help="Minimum safe Kd span required before Bayesian optimisation starts",
-    )
+    ap.add_argument("--bayes-region-min-span-kp", type=float, default=0.05, help="Diagnostic local span target for Kp")
+    ap.add_argument("--bayes-region-min-span-ki", type=float, default=0.05, help="Diagnostic local span target for Ki")
+    ap.add_argument("--bayes-region-min-span-kd", type=float, default=0.01, help="Diagnostic local span target for Kd")
     ap.add_argument(
         "--bayes-safe-invalid-ratio",
         type=float,
         default=0.20,
-        help="Maximum invalid ratio a warmup trial can have and still count as safe for Bayesian startup",
+        help="Maximum invalid ratio a bootstrap trial can have and still count as safe",
     )
     ap.add_argument(
         "--bayes-safe-oscillation-rate",
         type=float,
         default=0.30,
-        help="Maximum oscillation rate a warmup trial can have and still count as safe for Bayesian startup",
+        help="Maximum oscillation rate a bootstrap trial can have and still count as safe",
     )
     ap.add_argument(
         "--repeat-cancel-osc-threshold",
         type=float,
         default=0.80,
-        help="Cancel remaining repeats for a PID candidate when oscillation rate meets or exceeds this value",
+        help="Flag a repeat for oscillation when this rate is met or exceeded; two strikes cancel the candidate",
     )
     ap.add_argument(
         "--repeat-cancel-score-regression-pct",
         type=float,
         default=8.0,
-        help="Cancel remaining repeats only when the repeat score regresses by at least this percentage",
+        help="Flag a repeat for score regression when it degrades by at least this percentage versus prior valid repeats",
     )
     ap.add_argument(
         "--lock-growth-after-improve-pct",
@@ -1965,91 +478,31 @@ def main():
         help="If best improvement >= this, stop increasing step sizes on misses",
     )
     ap.add_argument("--early-stop-patience", type=int, default=12, help="Stop after N non-improving trials")
-    ap.add_argument(
-        "--retest-best-every",
-        type=int,
-        default=0,
-        help="Every N trials, re-run current best PID for verification (0 disables)",
-    )
-    ap.add_argument(
-        "--refine-activate-improve-pct",
-        type=float,
-        default=25.0,
-        help="Enable local refinement bounds after this best-improvement percentage",
-    )
+    ap.add_argument("--retest-best-every", type=int, default=0, help="Every N trials, re-run current best PID for verification (0 disables)")
+    ap.add_argument("--refine-activate-improve-pct", type=float, default=25.0, help="Enable local refinement bounds after this best-improvement percentage")
     ap.add_argument("--refine-radius-kp", type=float, default=0.2, help="Refinement radius around best Kp")
     ap.add_argument("--refine-radius-ki", type=float, default=0.2, help="Refinement radius around best Ki")
     ap.add_argument("--refine-radius-kd", type=float, default=0.05, help="Refinement radius around best Kd")
     ap.add_argument("--no-gui", action="store_true", help="Disable launch GUI and use console prompts")
     ap.add_argument("--power-csv", default="tuning_power_readings.csv", help="CSV file for graphing power readings")
     ap.add_argument("--test-duration-s", type=float, default=12.0, help="Seconds per individual laser test")
-    ap.add_argument(
-        "--warmup-repeats",
-        type=int,
-        default=3,
-        help="Number of repeated tests per candidate during candidate gathering",
-    )
-    ap.add_argument(
-        "--bo-repeats",
-        type=int,
-        default=5,
-        help="Number of repeated tests per candidate during Bayesian optimisation",
-    )
+    ap.add_argument("--warmup-repeats", type=int, default=3, help="Number of repeated tests per candidate during bootstrap")
+    ap.add_argument("--bo-repeats", type=int, default=5, help="Number of repeated tests per candidate during optimisation")
     ap.add_argument("--frequency-khz", type=int, default=0, help="Laser frequency in kHz for the startup program command")
     ap.add_argument(
         "--surrogate-model",
         choices=("extra_trees", "random_forest", "none"),
         default="extra_trees",
-        help="Lightweight surrogate model used after warmup",
+        help="Lightweight surrogate model used after bootstrap",
     )
-    ap.add_argument(
-        "--surrogate-min-samples",
-        type=int,
-        default=8,
-        help="Minimum completed candidates before surrogate-guided search is enabled",
-    )
-    ap.add_argument(
-        "--surrogate-retrain-every",
-        type=int,
-        default=1,
-        help="Refit the surrogate every N completed candidates",
-    )
-    ap.add_argument(
-        "--surrogate-pool-size",
-        type=int,
-        default=36,
-        help="Candidate pool size scored by the surrogate before each proposal",
-    )
-    ap.add_argument(
-        "--surrogate-explore-prob",
-        type=float,
-        default=0.25,
-        help="Exploration probability during surrogate-guided search",
-    )
-    ap.add_argument(
-        "--surrogate-jitter-scale",
-        type=float,
-        default=1.25,
-        help="Scale factor for surrogate proposal jitter around safe/best points",
-    )
-    ap.add_argument(
-        "--bo-refine-trials",
-        type=int,
-        default=4,
-        help="Optional BO-style refinement trials after surrogate search (0 disables)",
-    )
-    ap.add_argument(
-        "--validation-trials",
-        type=int,
-        default=1,
-        help="Optional validation re-tests of the final best candidate after optimisation (does not count toward --iters)",
-    )
-    ap.add_argument(
-        "--validation-repeats",
-        type=int,
-        default=5,
-        help="Number of repeated tests per validation candidate",
-    )
+    ap.add_argument("--surrogate-min-samples", type=int, default=8, help="Minimum completed candidates before surrogate-guided search is enabled")
+    ap.add_argument("--surrogate-retrain-every", type=int, default=1, help="Refit the surrogate every N completed candidates")
+    ap.add_argument("--surrogate-pool-size", type=int, default=36, help="Candidate pool size scored by the surrogate before each proposal")
+    ap.add_argument("--surrogate-explore-prob", type=float, default=0.25, help="Exploration probability during surrogate-guided search")
+    ap.add_argument("--surrogate-jitter-scale", type=float, default=1.25, help="Scale factor for surrogate proposal jitter around safe/best points")
+    ap.add_argument("--bo-refine-trials", type=int, default=4, help="Optional BO-style refinement trials after surrogate search (0 disables)")
+    ap.add_argument("--validation-trials", type=int, default=1, help="Optional validation re-tests of the final best candidate after optimisation (does not count toward --iters)")
+    ap.add_argument("--validation-repeats", type=int, default=5, help="Number of repeated tests per validation candidate")
     args = ap.parse_args()
 
     default_goal = float(args.desired_output)
@@ -2069,8 +522,8 @@ def main():
                 fallback_power_w=default_goal,
                 fallback_frequency_khz=default_frequency_khz,
             )
-        except Exception as e:
-            log(f"Warning: Could not open serial port for startup defaults: {e}")
+        except Exception as exc:
+            log(f"Warning: Could not open serial port for startup defaults: {exc}")
         finally:
             if startup_ser is not None:
                 startup_ser.close()
@@ -2083,6 +536,7 @@ def main():
         test_duration_s = None
         frequency_khz = None
         monitor = None
+
         if not args.no_gui:
             ui = prompt_launch_gui(default_goal, args.iters, args.test_duration_s, default_frequency_khz, root=root)
             if ui is not None:
@@ -2110,8 +564,8 @@ def main():
         if action == "graph":
             try:
                 run_graph_tool(args.power_csv, prefer_gui=(not args.no_gui))
-            except RuntimeError as e:
-                log(f"Graph tool error: {e}")
+            except RuntimeError as exc:
+                log(f"Graph tool error: {exc}")
             log("Graph tool closed; returning to main menu.")
             continue
 
@@ -2138,24 +592,20 @@ def main():
             log(f"Goal power output set to {desired_output:.4f}")
             if n_trials is None:
                 n_trials = prompt_trial_count(args.iters)
-            log(
-                f"Configured counted optimisation trials after bootstrap: {n_trials} "
-                "(bootstrap and validation are extra and logged separately)"
-            )
+            log(f"Configured counted optimisation trials after bootstrap: {n_trials}")
             if test_duration_s is None:
                 test_duration_s = float(args.test_duration_s)
             log(f"Configured per-test duration: {test_duration_s:.2f}s")
-            log(
-                f"Configured repeats: warmup={int(args.warmup_repeats)}, "
-                f"BO={int(args.bo_repeats)}"
-            )
+            log(f"Configured repeats: warmup={int(args.warmup_repeats)}, BO={int(args.bo_repeats)}")
             if frequency_khz is None:
                 frequency_khz = int(default_frequency_khz)
             log(f"Configured frequency: {frequency_khz} kHz")
+
             if monitor is not None:
                 monitor.set_target(desired_output)
-                monitor.set_phase("Phase: Bootstrap / safe-range discovery")
+                monitor.set_phase("BOOTSTRAP")
                 monitor.set_status("Sending startup program command")
+                monitor.set_candidate_source("bootstrap")
 
             configure_program(io, power_w=desired_output, frequency_khz=frequency_khz)
             log(
@@ -2168,8 +618,6 @@ def main():
                 monitor.set_status("Program setup applied")
 
             duration = 15.0
-
-            # Keep a trial-by-trial record for later review.
             history: list[dict] = []
             power_rows: list[tuple] = []
             trace_feature_rows: list[dict] = []
@@ -2196,38 +644,46 @@ def main():
             axis_directions = [1.0, 1.0, 1.0]
             safe_trial_points: list[tuple[float, float, float]] = []
             good_trial_points: list[tuple[float, float, float]] = []
+            unsafe_trial_points: list[tuple[float, float, float]] = []
             observed_points: list[tuple[float, float, float]] = []
             observed_scores: list[float] = []
             surrogate_training_rows: list[dict] = []
             surrogate = OnlineSurrogateModel(args.surrogate_model, random_state=42)
             surrogate_active = False
             rng = random.Random(42)
-            region_status = {
-                "ready": False,
-                "reason": "no safe candidates yet",
-                "unique_counts": (0, 0, 0),
-                "spans": (0.0, 0.0, 0.0),
-                "axis_statuses": [],
-                "blocking_axis": None,
-            }
             bootstrap_target = max(1, int(args.coordinate_warmup_trials))
             max_bootstrap_trials = max(bootstrap_target, int(args.max_bootstrap_trials))
+
+            region_status = assess_local_safe_region(
+                safe_trial_points,
+                good_trial_points,
+                unsafe_trial_points,
+                best_pid=best_pid,
+                min_safe_candidates=args.bayes_min_safe_trials,
+                min_good_candidates=args.bayes_region_min_good_candidates,
+                min_points_per_axis=args.bayes_region_min_points_per_axis,
+                min_span_kp=args.bayes_region_min_span_kp,
+                min_span_ki=args.bayes_region_min_span_ki,
+                min_span_kd=args.bayes_region_min_span_kd,
+                step_kp=step_kp,
+                step_ki=step_ki,
+                step_kd=step_kd,
+            )
             bootstrap_status = assess_bootstrap_progress(
                 bootstrap_trials_done=0,
                 bootstrap_trials_minimum=bootstrap_target,
                 max_bootstrap_trials=max_bootstrap_trials,
                 region_status=region_status,
             )
+
             if monitor is not None:
-                monitor.set_phase("BOOTSTRAP")
-                monitor.set_candidate_source("bootstrap")
                 monitor.set_trial_counters(bootstrap_used=0, optimisation_used=0, validation_used=0)
                 monitor.set_axis_coverage(region_status["axis_statuses"])
                 monitor.set_best_candidate(kp=None, ki=None, kd=None, score=None)
                 monitor.set_warmup_counter(
-                    f"Bootstrap: 0 trials run | minimum {bootstrap_target} not yet reached | cap {max_bootstrap_trials}"
+                    f"Bootstrap: 0 trials run | floor {bootstrap_target} not yet reached | cap {max_bootstrap_trials}"
                 )
-                monitor.set_warmup_change("Bootstrap change: baseline trial using current hardware PID (no bootstrap delta)")
+                monitor.set_warmup_change("Bootstrap change: baseline trial using current hardware PID")
                 monitor.set_previous_warmup_result("Previous bootstrap result: none yet")
                 monitor.set_readiness(
                     format_readiness_status(
@@ -2237,14 +693,6 @@ def main():
                         safe_target=int(args.bayes_min_safe_trials),
                         good_count=0,
                         good_target=int(args.bayes_region_min_good_candidates),
-                        unique_counts=(0, 0, 0),
-                        per_axis_target=int(args.bayes_region_min_points_per_axis),
-                        spans=(0.0, 0.0, 0.0),
-                        span_targets=(
-                            float(args.bayes_region_min_span_kp),
-                            float(args.bayes_region_min_span_ki),
-                            float(args.bayes_region_min_span_kd),
-                        ),
                         warmup_trials_done=0,
                     )
                 )
@@ -2327,20 +775,17 @@ def main():
                             "test_note": str(test_meta.get("reason", "")),
                             "strict_bad_rate": float(test_meta.get("strict_bad_rate", 1.0)),
                             "oscillation_rate": float(test_meta.get("oscillation_rate", 1.0)),
+                            "failure_categories": "|".join(test_meta.get("failure_categories", [])),
+                            "repeat_score_regression_pct": float(test_meta.get("score_regression_pct", 0.0)),
+                            "repeat_cancellation_decision": str(test_meta.get("cancellation_decision", "")),
                             **repeat_feature,
                         }
                     )
 
-                for test_idx, (test_powers, test_times, test_meta) in enumerate(
-                    zip(per_test_powers, per_test_times, per_test_meta),
-                    start=1,
-                ):
+                for test_idx, (test_powers, test_times, test_meta) in enumerate(zip(per_test_powers, per_test_times, per_test_meta), start=1):
                     if test_powers.size == 0:
                         continue
-                    if test_times.size == test_powers.size:
-                        time_vals = test_times.tolist()
-                    else:
-                        time_vals = list(range(int(test_powers.size)))
+                    time_vals = test_times.tolist() if test_times.size == test_powers.size else list(range(int(test_powers.size)))
                     for sample_idx, (t_s, power_val) in enumerate(zip(time_vals, test_powers.tolist()), start=1):
                         power_rows.append(
                             (
@@ -2378,11 +823,13 @@ def main():
                 nonlocal baseline_score, best_score_seen, best_pid, best_metrics, last_applied
                 nonlocal no_improve_count, step_kp, step_ki, step_kd, axis_index, surrogate_active
                 nonlocal region_status, bootstrap_status
+
                 phase = mode_to_phase(mode)
                 is_warmup_mode = mode == "warmup"
                 is_surrogate_mode = mode.startswith("surrogate")
                 is_bo_mode = mode == "bo"
                 is_validation_mode = mode == "validation"
+
                 if is_warmup_mode:
                     display_phase_name = "Bootstrap"
                     display_phase_index = bootstrap_trial_count + 1
@@ -2398,22 +845,22 @@ def main():
                 else:
                     display_phase_name = "Optimisation"
                     display_phase_index = fallback_trial_count + 1
+
                 display_phase_total, bootstrap_increment, optimisation_increment, validation_increment = counted_trial_totals(
                     mode=mode,
                     n_trials=int(n_trials),
                     validation_trials=int(args.validation_trials),
                 )
-                if is_warmup_mode:
-                    phase_repeats = max(1, int(args.warmup_repeats))
-                elif is_validation_mode:
-                    phase_repeats = max(1, int(args.validation_repeats))
-                else:
-                    phase_repeats = max(1, int(args.bo_repeats))
+                phase_repeats = max(
+                    1,
+                    int(args.warmup_repeats if is_warmup_mode else args.validation_repeats if is_validation_mode else args.bo_repeats),
+                )
                 log(
                     f"{display_phase_name} trial {display_phase_index}"
                     + (f"/{display_phase_total}" if display_phase_total is not None else "")
                     + f" (overall {trial_index + 1})"
                 )
+
                 if monitor is not None:
                     monitor.set_phase(format_phase_display(mode))
                     if not is_validation_mode:
@@ -2438,7 +885,7 @@ def main():
                     elif mode == "fallback":
                         monitor.set_warmup_change("Optimisation change: fallback coordinate search")
                     else:
-                        monitor.set_warmup_change("Bootstrap change: safe-range discovery in progress")
+                        monitor.set_warmup_change("Bootstrap: searching for stable local region")
                     progress = f"{display_phase_name} trial {display_phase_index}"
                     if display_phase_total is not None:
                         progress = f"{progress}/{display_phase_total}"
@@ -2477,18 +924,17 @@ def main():
                 )
 
                 used_kp, used_ki, used_kd = kp, ki, kd
-                if trial_index == 0:
-                    if current_pid is not None:
-                        used_kp = float(current_pid["pw_kp"])
-                        used_ki = float(current_pid["pw_ki"])
-                        used_kd = float(current_pid["pw_kd"])
-                        log(
-                            "Stored initial laser PID values for baseline trial: "
-                            f"kp={used_kp:.4f}, ki={used_ki:.4f}, kd={used_kd:.4f}"
-                        )
-                        last_applied = (used_kp, used_ki, used_kd)
-                    else:
-                        last_applied = None
+                if trial_index == 0 and current_pid is not None:
+                    used_kp = float(current_pid["pw_kp"])
+                    used_ki = float(current_pid["pw_ki"])
+                    used_kd = float(current_pid["pw_kd"])
+                    log(
+                        "Stored initial laser PID values for baseline trial: "
+                        f"kp={used_kp:.4f}, ki={used_ki:.4f}, kd={used_kd:.4f}"
+                    )
+                    last_applied = (used_kp, used_ki, used_kd)
+                elif trial_index == 0:
+                    last_applied = None
                 else:
                     last_applied = (used_kp, used_ki, used_kd)
 
@@ -2547,7 +993,6 @@ def main():
                             step_kp = min(float(args.max_step_kp), step_kp * float(args.step_growth_factor))
                             step_ki = min(float(args.max_step_ki), step_ki * float(args.step_growth_factor))
                             step_kd = min(float(args.max_step_kd), step_kd * float(args.step_growth_factor))
-
                     if used_axis is not None:
                         axis_index = (used_axis + 1) % 3
 
@@ -2580,6 +1025,8 @@ def main():
                     )
                     if is_safe_candidate:
                         safe_trial_points.append((used_kp, used_ki, used_kd))
+                    else:
+                        unsafe_trial_points.append((used_kp, used_ki, used_kd))
                     if candidate_is_good(
                         metrics,
                         score,
@@ -2591,15 +1038,21 @@ def main():
                         max_score_factor=args.bayes_region_good_score_factor,
                     ):
                         good_trial_points.append((used_kp, used_ki, used_kd))
-                    region_status = assess_bayes_region(
+
+                    region_status = assess_local_safe_region(
                         safe_trial_points,
                         good_trial_points,
+                        unsafe_trial_points,
+                        best_pid=best_pid,
                         min_safe_candidates=args.bayes_min_safe_trials,
-                        min_points_per_axis=args.bayes_region_min_points_per_axis,
                         min_good_candidates=args.bayes_region_min_good_candidates,
+                        min_points_per_axis=args.bayes_region_min_points_per_axis,
                         min_span_kp=args.bayes_region_min_span_kp,
                         min_span_ki=args.bayes_region_min_span_ki,
                         min_span_kd=args.bayes_region_min_span_kd,
+                        step_kp=step_kp,
+                        step_ki=step_ki,
+                        step_kd=step_kd,
                     )
                     bootstrap_done = bootstrap_trial_count + 1
                     bootstrap_status = assess_bootstrap_progress(
@@ -2609,23 +1062,20 @@ def main():
                         region_status=region_status,
                     )
                     log(
-                        "Candidate region status -> "
+                        "Bootstrap region status -> "
                         f"region_ready={region_status['ready']}, "
                         f"bootstrap_ready={bootstrap_status['ready']}, "
                         f"reason={bootstrap_status['reason']}, "
-                        f"blocking_axis={bootstrap_status['blocking_axis']}, "
-                        f"safe={len(safe_trial_points)}, "
-                        f"good={len(good_trial_points)}, "
-                        f"unique={region_status['unique_counts']}, "
-                        f"spans=({region_status['spans'][0]:.4f},"
-                        f"{region_status['spans'][1]:.4f},"
-                        f"{region_status['spans'][2]:.4f})"
+                        f"local_safe={region_status.get('local_safe_count', 0)}, "
+                        f"local_good={region_status.get('local_good_count', 0)}, "
+                        f"local_unsafe={region_status.get('local_unsafe_count', 0)}, "
+                        f"variation_axes={region_status.get('local_variation_axes', 0)}/3"
                     )
                     if monitor is not None:
                         monitor.set_axis_coverage(region_status["axis_statuses"])
                         monitor.set_warmup_counter(
                             f"Bootstrap: {bootstrap_done} trials run | "
-                            f"minimum {bootstrap_target} "
+                            f"floor {bootstrap_target} "
                             f"{'reached' if bootstrap_status['minimum_reached'] else 'not yet reached'} | "
                             f"cap {max_bootstrap_trials}"
                         )
@@ -2640,10 +1090,10 @@ def main():
                                     aborted=aborted,
                                     baseline_score=baseline_score,
                                     safe_invalid_ratio=args.bayes_safe_invalid_ratio,
-                                safe_oscillation_rate=args.bayes_safe_oscillation_rate,
-                                good_score_factor=args.bayes_region_good_score_factor,
+                                    safe_oscillation_rate=args.bayes_safe_oscillation_rate,
+                                    good_score_factor=args.bayes_region_good_score_factor,
+                                )
                             )
-                        )
                         monitor.set_readiness(
                             format_readiness_status(
                                 bootstrap_status=bootstrap_status,
@@ -2652,29 +1102,19 @@ def main():
                                 safe_target=int(args.bayes_min_safe_trials),
                                 good_count=len(good_trial_points),
                                 good_target=int(args.bayes_region_min_good_candidates),
-                                unique_counts=tuple(region_status["unique_counts"]),
-                                per_axis_target=int(args.bayes_region_min_points_per_axis),
-                                spans=tuple(region_status["spans"]),
-                                span_targets=(
-                                    float(args.bayes_region_min_span_kp),
-                                    float(args.bayes_region_min_span_ki),
-                                    float(args.bayes_region_min_span_kd),
-                                ),
                                 warmup_trials_done=bootstrap_done,
                             )
                         )
                         if bool(bootstrap_status.get("ready")):
-                            monitor.set_phase("BOOTSTRAP")
-                            monitor.set_progress("Surrogate guidance ready | preparing model")
+                            monitor.set_progress("Local safe region found near best candidate")
                             monitor.set_warmup_change("Bootstrap change: complete")
 
-                    if args.surrogate_model != "none" and (len(surrogate_training_rows) % max(1, int(args.surrogate_retrain_every)) == 0):
+                    if args.surrogate_model != "none" and (
+                        len(surrogate_training_rows) % max(1, int(args.surrogate_retrain_every)) == 0
+                    ):
                         surrogate_active = surrogate.fit(
                             surrogate_training_rows,
-                            min_samples=max(
-                                int(args.surrogate_min_samples),
-                                int(args.bayes_min_safe_trials),
-                            ),
+                            min_samples=max(int(args.surrogate_min_samples), int(args.bayes_min_safe_trials)),
                         )
                     elif len(surrogate_training_rows) < int(args.surrogate_min_samples):
                         surrogate_active = False
@@ -2720,28 +1160,13 @@ def main():
                 )
 
                 log(
-                    f"Result -> score={score:.2f}, "
-                    f"improve={improve_vs_base_pct:.2f}%, "
-                    f"best_improve={best_improve_vs_base_pct:.2f}%, "
-                    f"no_improve={no_improve_count}, "
+                    f"Result -> score={score:.2f}, improve={improve_vs_base_pct:.2f}%, "
+                    f"best_improve={best_improve_vs_base_pct:.2f}%, no_improve={no_improve_count}, "
                     f"step=({step_kp:.4f},{step_ki:.4f},{step_kd:.4f}), "
-                    f"start_err={metrics['start_error']:.5f}, "
-                    f"track_err={metrics['track_error']:.5f}, "
-                    f"dev={metrics['deviation']:.5f}, "
-                    f"max_err={metrics['max_error']:.5f}, "
-                    f"strict_bad={metrics['strict_bad_rate']:.5f}, "
-                    f"osc={metrics['oscillation_rate']:.5f}, "
-                    f"overshoot={metrics['overshoot_pct']:.3f}, "
-                    f"settle={metrics['settling_time_s']:.3f}, "
-                    f"sse={metrics['steady_state_error']:.5f}, "
-                    f"hold={metrics.get('hold_quality', math.nan):.3f}, "
-                    f"hold_tol={metrics.get('hold_time_in_tolerance_ratio', math.nan):.3f}, "
-                    f"hold_var={metrics.get('hold_variance', math.nan):.5f}, "
-                    f"iae={metrics['iae']:.5f}, "
-                    f"invalid={metrics['invalid_ratio']:.3f}, "
-                    f"repeat={metrics['repeatability']:.5f}, "
-                    f"cancelled={cancelled_candidate}, "
-                    f"aborted={aborted}"
+                    f"track_err={metrics['track_error']:.5f}, max_err={metrics['max_error']:.5f}, "
+                    f"osc={metrics['oscillation_rate']:.5f}, hold={metrics.get('hold_quality', math.nan):.3f}, "
+                    f"invalid={metrics['invalid_ratio']:.3f}, repeat={metrics['repeatability']:.5f}, "
+                    f"cancelled={cancelled_candidate}, aborted={aborted}"
                 )
                 if cancelled_candidate:
                     log(f"Candidate repeats cancelled early: {cancel_reason}")
@@ -2760,6 +1185,7 @@ def main():
                 else:
                     optimisation_trial_count += 1
                     fallback_trial_count += 1
+
                 if (
                     args.retest_best_every > 0
                     and phase == "optimisation"
@@ -2771,6 +1197,7 @@ def main():
                         f"kp={best_pid[0]:.4f}, ki={best_pid[1]:.4f}, kd={best_pid[2]:.4f}"
                     )
                     evaluate_candidate(best_pid[0], best_pid[1], best_pid[2], mode="validation")
+
                 if (not is_validation_mode) and args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
                     raise EarlyStopOptimization(
                         f"No score improvement for {no_improve_count} trials (patience={args.early_stop_patience})"
@@ -2812,39 +1239,27 @@ def main():
                         ki_max=args.ki_max,
                         kd_max=args.kd_max,
                     )
-                    axis_state = next(
-                        (status for status in axis_statuses if int(status["axis_index"]) == int(used_axis)),
-                        None,
-                    )
-                    coverage_summary = ""
+                    axis_state = next((status for status in axis_statuses if int(status["axis_index"]) == int(used_axis)), None)
+                    diagnostic = ""
                     if axis_state is not None:
-                        coverage_summary = (
-                            f"coverage={axis_state['distinct_safe_values']}/{axis_state['required_distinct_values']}, "
+                        diagnostic = (
+                            f"global_safe={axis_state['distinct_safe_values']}/{axis_state['required_distinct_values']}, "
                             f"span={axis_state['safe_span']:.4f}/{axis_state['required_safe_span']:.4f}, "
-                            f"complete={axis_state['complete']}, "
                         )
                     log(
-                        "Coordinate candidate -> "
+                        "Bootstrap candidate -> "
                         f"base=({base_pid[0]:.4f},{base_pid[1]:.4f},{base_pid[2]:.4f}), "
                         f"axis={AXIS_NAMES[used_axis]}, delta={candidate_delta:+.4f}, "
-                        f"{coverage_summary}"
-                        f"candidate=({kp:.4f},{ki:.4f},{kd:.4f})"
+                        f"{diagnostic}candidate=({kp:.4f},{ki:.4f},{kd:.4f})"
                     )
                     if monitor is not None:
                         monitor.set_warmup_change(
-                            format_warmup_change_message(
-                                base_pid,
-                                (kp, ki, kd),
-                                used_axis,
-                                candidate_delta,
-                            )
+                            format_warmup_change_message(base_pid, (kp, ki, kd), used_axis, candidate_delta)
                         )
                 else:
                     kp, ki, kd = 0.0, 0.0, 0.0
                     if monitor is not None:
-                        monitor.set_warmup_change(
-                            format_warmup_change_message(None, (kp, ki, kd), None, 0.0)
-                        )
+                        monitor.set_warmup_change(format_warmup_change_message(None, (kp, ki, kd), None, 0.0))
 
                 score = evaluate_candidate(kp, ki, kd, mode="warmup", used_axis=used_axis)
                 if used_axis is not None:
@@ -2912,12 +1327,12 @@ def main():
                 axis_index = (used_axis + 1) % 3
                 return score
 
-            log("Starting bootstrap safe-range discovery")
+            log("Starting bootstrap search for a stable local safe region")
             if monitor is not None:
                 monitor.set_phase(format_phase_display("warmup"))
                 monitor.set_candidate_source(format_candidate_source("warmup"))
+
             try:
-                warmup_target = bootstrap_target
                 while bootstrap_trial_count < max_bootstrap_trials and not bool(bootstrap_status["ready"]):
                     run_coordinate_trial()
 
@@ -2930,29 +1345,25 @@ def main():
                         f"planned phase budgets -> surrogate={surrogate_budget}, bo_refine={bo_budget}"
                     )
                     if monitor is not None:
-                        monitor.set_phase(format_phase_display("warmup"))
-                        monitor.set_warmup_counter("")
                         monitor.set_readiness(
-                            "Bootstrap readiness:\n"
-                            f"Bootstrap: {bootstrap_trial_count} trials run | minimum {bootstrap_target} reached | "
-                            f"cap {max_bootstrap_trials}\n"
-                            "Blocking axis: none\n"
-                            "Safe region ready. Switching to counted optimisation."
+                            format_readiness_status(
+                                bootstrap_status=bootstrap_status,
+                                region_status=region_status,
+                                safe_count=len(safe_trial_points),
+                                safe_target=int(args.bayes_min_safe_trials),
+                                good_count=len(good_trial_points),
+                                good_target=int(args.bayes_region_min_good_candidates),
+                                warmup_trials_done=bootstrap_trial_count,
+                            )
                         )
 
                     if args.surrogate_model != "none":
                         surrogate_active = surrogate.fit(
                             surrogate_training_rows,
-                            min_samples=max(
-                                int(args.surrogate_min_samples),
-                                int(args.bayes_min_safe_trials),
-                            ),
+                            min_samples=max(int(args.surrogate_min_samples), int(args.bayes_min_safe_trials)),
                         )
                         if surrogate_active:
-                            log(
-                                f"Surrogate ready -> model={args.surrogate_model}, "
-                                f"samples={surrogate.last_fit_count}"
-                            )
+                            log(f"Surrogate ready -> model={args.surrogate_model}, samples={surrogate.last_fit_count}")
                         else:
                             reason = surrogate.last_error or "not enough data"
                             log(f"Surrogate unavailable, falling back safely: {reason}")
@@ -2984,11 +1395,7 @@ def main():
                             pad_ki=step_ki,
                             pad_kd=step_kd,
                         )
-                        seed_points, seed_scores = filter_seed_points_for_space(
-                            observed_points,
-                            observed_scores,
-                            bayes_space,
-                        )
+                        seed_points, seed_scores = filter_seed_points_for_space(observed_points, observed_scores, bayes_space)
                         gp_minimize(
                             lambda x: evaluate_candidate(float(x[0]), float(x[1]), float(x[2]), mode="bo"),
                             bayes_space,
@@ -3011,16 +1418,13 @@ def main():
                 else:
                     log(
                         "Optimisation phases skipped: "
-                        f"no viable safe region found after {bootstrap_trial_count} bootstrap trials "
-                        f"(minimum {bootstrap_target}, cap {max_bootstrap_trials}; {bootstrap_status['reason']})"
+                        f"no stable local safe region found after {bootstrap_trial_count} bootstrap trials "
+                        f"(floor {bootstrap_target}, cap {max_bootstrap_trials}; {bootstrap_status['reason']})"
                     )
                     if monitor is not None:
-                        monitor.set_phase(format_phase_display("warmup"))
-                        monitor.set_candidate_source(format_candidate_source("warmup"))
                         monitor.set_progress(
                             f"Bootstrap stopped after {bootstrap_trial_count} trials | {bootstrap_status['reason']}"
                         )
-                        monitor.set_warmup_counter("")
                         monitor.set_readiness(
                             format_readiness_status(
                                 bootstrap_status=bootstrap_status,
@@ -3029,26 +1433,13 @@ def main():
                                 safe_target=int(args.bayes_min_safe_trials),
                                 good_count=len(good_trial_points),
                                 good_target=int(args.bayes_region_min_good_candidates),
-                                unique_counts=tuple(region_status["unique_counts"]),
-                                per_axis_target=int(args.bayes_region_min_points_per_axis),
-                                spans=tuple(region_status["spans"]),
-                                span_targets=(
-                                    float(args.bayes_region_min_span_kp),
-                                    float(args.bayes_region_min_span_ki),
-                                    float(args.bayes_region_min_span_kd),
-                                ),
                                 warmup_trials_done=bootstrap_trial_count,
                             )
                         )
-            except EarlyStopOptimization as e:
-                log(f"Early stop: {e}")
+            except EarlyStopOptimization as exc:
+                log(f"Early stop: {exc}")
 
-            if (
-                bool(region_status["ready"])
-                and best_pid is not None
-                and int(args.validation_trials) > 0
-                and optimisation_trial_count > 0
-            ):
+            if bool(region_status["ready"]) and best_pid is not None and int(args.validation_trials) > 0 and optimisation_trial_count > 0:
                 log(f"Starting validation phase for {int(args.validation_trials)} trial(s)")
                 if monitor is not None:
                     monitor.set_phase(format_phase_display("validation"))
@@ -3061,6 +1452,7 @@ def main():
                 best_kp, best_ki, best_kd = last_applied
             else:
                 best_kp, best_ki, best_kd = 0.0, 0.0, 0.0
+
             log("Tuning complete")
             if monitor is not None:
                 monitor.set_phase(format_phase_display("validation" if validation_trial_count > 0 else "fallback"))
@@ -3080,45 +1472,49 @@ def main():
                         hold_quality=best_metrics.get("hold_quality"),
                     )
             log(f"BEST kp={best_kp:.6f}, ki={best_ki:.6f}, kd={best_kd:.6f}")
-            if best_score_seen < float("inf"):
+            if best_score_seen < float('inf'):
                 log(f"Best score={best_score_seen:.3f}")
             log(
                 "Phase counts -> "
-                f"bootstrap={bootstrap_trial_count}, "
-                f"optimisation={optimisation_trial_count}, "
-                f"validation={validation_trial_count}"
+                f"bootstrap={bootstrap_trial_count}, optimisation={optimisation_trial_count}, validation={validation_trial_count}"
             )
 
             with open("tuning_history.csv", "w", newline="") as f:
-                fieldnames = ordered_row_fieldnames(history, [
-                    "trial_index",
-                    "phase",
-                    "phase_mode",
-                    "candidate_selection_mode",
-                    "surrogate_active",
-                    "predicted_score",
-                    "desired_output",
-                    "frequency_khz",
-                    "kp",
-                    "ki",
-                    "kd",
-                    "score",
-                ])
+                fieldnames = ordered_row_fieldnames(
+                    history,
+                    [
+                        "trial_index",
+                        "phase",
+                        "phase_mode",
+                        "candidate_selection_mode",
+                        "surrogate_active",
+                        "predicted_score",
+                        "desired_output",
+                        "frequency_khz",
+                        "kp",
+                        "ki",
+                        "kd",
+                        "score",
+                    ],
+                )
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(history)
             log("Saved tuning_history.csv")
 
             with open("tuning_trace_features.csv", "w", newline="") as f:
-                fieldnames = ordered_row_fieldnames(trace_feature_rows, [
-                    "trial_index",
-                    "phase",
-                    "repeat_index",
-                    "phase_mode",
-                    "kp",
-                    "ki",
-                    "kd",
-                ])
+                fieldnames = ordered_row_fieldnames(
+                    trace_feature_rows,
+                    [
+                        "trial_index",
+                        "phase",
+                        "repeat_index",
+                        "phase_mode",
+                        "kp",
+                        "ki",
+                        "kd",
+                    ],
+                )
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(trace_feature_rows)
