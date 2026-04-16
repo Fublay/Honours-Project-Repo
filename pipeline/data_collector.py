@@ -10,15 +10,22 @@ from protocol.reply_parser import parse_telemetry_line
 from domain.value_mapper import map_telemetry_values
 
 
+class StartupTelemetryTimeoutError(TimeoutError):
+    """Raised when no valid telemetry sample arrives after START within the allowed window."""
+
+
 def collect_trial_data(
     io,
     *,
     line_timeout: float = 1.0,
     sample_interval_s: float | None = None,
     duration_s: float | None = None,
+    wait_for_first_sample_timeout_s: float | None = None,
     stop_on_done: bool = True,
     on_sample=None,
     on_done=None,
+    on_waiting_for_first_sample=None,
+    on_first_sample=None,
 ):
     """Collect one block of telemetry samples from the serial stream.
 
@@ -36,12 +43,24 @@ def collect_trial_data(
     # We build plain Python lists first because append-in-a-loop is fast/safe.
     t_vals, y_vals, u_vals, status_vals = [], [], [], []
     sample_idx = 0
-    t_start = time.monotonic()
+    t_start = None
+    wait_started_at = time.monotonic()
+    first_sample_time_s = None
+
+    if on_waiting_for_first_sample is not None:
+        on_waiting_for_first_sample()
 
     while True:
         # Time-window mode: leave once the requested capture time has passed.
-        if duration_s is not None and (time.monotonic() - t_start) >= duration_s:
+        now = time.monotonic()
+        if t_start is not None and duration_s is not None and (now - t_start) >= duration_s:
             break
+        if (
+            t_start is None
+            and wait_for_first_sample_timeout_s is not None
+            and (now - wait_started_at) >= wait_for_first_sample_timeout_s
+        ):
+            raise StartupTelemetryTimeoutError("no telemetry received after START")
 
         try:
             line = io.read_line(timeout=line_timeout)
@@ -56,6 +75,13 @@ def collect_trial_data(
         if telemetry is not None:
             mapped = map_telemetry_values(telemetry)
             mapped_t = mapped.get("time_s")
+            if t_start is None:
+                t_start = time.monotonic()
+                if mapped_t is not None:
+                    first_sample_time_s = float(mapped_t)
+                if on_first_sample is not None:
+                    on_first_sample(float(t_start - wait_started_at), mapped)
+
             if mapped_t is None:
                 # Some packet formats do not include explicit time.
                 # In that case, synthesize time from sample interval if known.
@@ -65,7 +91,9 @@ def collect_trial_data(
                     # Last fallback: use sample count as a coarse timeline.
                     t_val = float(sample_idx)
             else:
-                t_val = float(mapped_t)
+                if first_sample_time_s is None:
+                    first_sample_time_s = float(mapped_t)
+                t_val = float(mapped_t) - float(first_sample_time_s)
 
             t_vals.append(t_val)
             y_vals.append(mapped["process_value"])

@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 import laser_command_ids as CMD
-from pipeline.data_collector import collect_trial_data
+from pipeline.data_collector import StartupTelemetryTimeoutError, collect_trial_data
 from protocol.reply_parser import parse_ack
 from transport.serial_interface import SerialLineIO
 from tuning.metrics import score_single_repeat
@@ -84,6 +84,7 @@ def run_trial(
     repeats: int = 5,
     test_duration_s: float = 12.0,
     startup_grace_s: float = 2.0,
+    startup_telemetry_timeout_s: float = 5.0,
     settled_window_samples: int = 5,
     duration: float = 8.0,
     kp_max: float = 1.0,
@@ -199,6 +200,7 @@ def run_trial(
                 timeout=2.0,
                 accepted_codes=("00", "08", "80"),
             )
+            log(f"Test {rep + 1}/{repeats}: START acknowledged")
 
             test_meta = {
                 "invalid": False,
@@ -285,14 +287,71 @@ def run_trial(
 
                 return False
 
-            rt, ry, ru, rs = collect_trial_data(
-                io,
-                line_timeout=0.5,
-                sample_interval_s=sample_interval_s,
-                duration_s=test_duration_s,
-                stop_on_done=False,
-                on_sample=on_sample,
-            )
+            def on_waiting_for_first_sample() -> None:
+                log(
+                    f"Test {rep + 1}/{repeats}: waiting for first telemetry "
+                    f"(timeout {startup_telemetry_timeout_s:.2f}s)"
+                )
+                if monitor is not None:
+                    monitor.set_progress(
+                        _candidate_progress_message(
+                            phase_name=phase_name,
+                            phase_trial_index=phase_trial_index,
+                            phase_trial_total=phase_trial_total,
+                            overall_trial_index=overall_trial_index,
+                            trial_index=trial_index,
+                            suffix=f"test {rep + 1}/{repeats} START acknowledged, waiting for first telemetry",
+                        )
+                    )
+
+            def on_first_sample(startup_delay_s: float, mapped: dict) -> None:
+                log(
+                    f"Test {rep + 1}/{repeats}: first valid telemetry received after "
+                    f"{startup_delay_s:.3f}s (status={mapped.get('status', 'RUNNING')})"
+                )
+                if monitor is not None:
+                    monitor.set_progress(
+                        _candidate_progress_message(
+                            phase_name=phase_name,
+                            phase_trial_index=phase_trial_index,
+                            phase_trial_total=phase_trial_total,
+                            overall_trial_index=overall_trial_index,
+                            trial_index=trial_index,
+                            suffix=f"test {rep + 1}/{repeats} active",
+                        )
+                    )
+
+            try:
+                rt, ry, ru, rs = collect_trial_data(
+                    io,
+                    line_timeout=0.5,
+                    sample_interval_s=sample_interval_s,
+                    duration_s=test_duration_s,
+                    wait_for_first_sample_timeout_s=startup_telemetry_timeout_s,
+                    stop_on_done=False,
+                    on_sample=on_sample,
+                    on_waiting_for_first_sample=on_waiting_for_first_sample,
+                    on_first_sample=on_first_sample,
+                )
+            except StartupTelemetryTimeoutError as exc:
+                rt, ry, ru, rs = [], [], [], []
+                test_meta["invalid"] = True
+                test_meta["reason"] = str(exc)
+                log(
+                    f"Test {rep + 1}/{repeats}: startup telemetry wait timed out after "
+                    f"{startup_telemetry_timeout_s:.2f}s"
+                )
+                if monitor is not None:
+                    monitor.set_progress(
+                        _candidate_progress_message(
+                            phase_name=phase_name,
+                            phase_trial_index=phase_trial_index,
+                            phase_trial_total=phase_trial_total,
+                            overall_trial_index=overall_trial_index,
+                            trial_index=trial_index,
+                            suffix=f"test {rep + 1}/{repeats} invalid: no telemetry received after START",
+                        )
+                    )
 
             t_offset = rep * test_duration_s
             t_vals.extend([float(v) + t_offset for v in rt])

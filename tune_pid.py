@@ -447,6 +447,12 @@ def main() -> None:
     ap.add_argument("--w-hold", type=float, default=5.0, help="Weight: explicit final hold-quality penalty")
     ap.add_argument("--invalid-penalty", type=float, default=800.0, help="Penalty multiplier for invalid tests")
     ap.add_argument("--startup-grace-s", type=float, default=2.0, help="Seconds to ignore startup overshoot")
+    ap.add_argument(
+        "--startup-telemetry-timeout-s",
+        type=float,
+        default=5.0,
+        help="Maximum seconds to wait after START for the first valid telemetry packet",
+    )
     ap.add_argument("--settled-window-samples", type=int, default=5, help="Consecutive in-band samples to mark settled")
     ap.add_argument("--max-step-kp", type=float, default=0.15, help="Max per-trial change in Kp")
     ap.add_argument("--max-step-ki", type=float, default=0.15, help="Max per-trial change in Ki")
@@ -1036,6 +1042,7 @@ def main() -> None:
                     repeats=phase_repeats,
                     test_duration_s=test_duration_s,
                     startup_grace_s=args.startup_grace_s,
+                    startup_telemetry_timeout_s=args.startup_telemetry_timeout_s,
                     settled_window_samples=args.settled_window_samples,
                     duration=duration,
                     kp_max=args.kp_max,
