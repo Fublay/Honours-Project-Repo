@@ -241,7 +241,7 @@ def format_readiness_status(
         "Bootstrap readiness:",
         bootstrap_line,
         f"{mark(safe_count >= safe_target)} Safe candidates: {safe_count}/{safe_target}",
-        f"{mark(good_count >= good_target)} Good candidates: {good_count}/{good_target}",
+        f"Good candidates observed: {good_count}/{good_target}",
         center_text,
         (
             "Local region: "
@@ -487,7 +487,7 @@ def main() -> None:
         "--bayes-region-min-good-candidates",
         type=int,
         default=2,
-        help="Minimum number of stable, target-holding bootstrap candidates required before optimisation starts",
+        help="Diagnostic target for stable, target-holding bootstrap candidates during bootstrap",
     )
     ap.add_argument(
         "--bayes-region-good-score-factor",

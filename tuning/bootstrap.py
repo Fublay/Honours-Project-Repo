@@ -252,23 +252,13 @@ def assess_local_safe_region(
     local_variation_axes = int(sum(varied_axes))
 
     local_safe_target = max(3, min(int(min_safe_candidates), 4))
-    local_good_target = max(2, int(min_good_candidates))
     if len(unique_safe_points) < int(min_safe_candidates):
         reason = f"only {len(unique_safe_points)} safe candidates collected so far"
-        ready = False
-    elif len(unique_good_points) < int(min_good_candidates):
-        reason = f"only {len(unique_good_points)} good candidates have reached and held target"
         ready = False
     elif len(local_safe) < local_safe_target:
         reason = (
             f"local safe region not dense enough near best candidate "
             f"({len(local_safe)}/{local_safe_target} nearby safe points)"
-        )
-        ready = False
-    elif len(local_good) < local_good_target:
-        reason = (
-            f"Bootstrap blocked: only {len(local_good)} good local point"
-            f"{'' if len(local_good) == 1 else 's'} found"
         )
         ready = False
     elif local_variation_axes < 2:
