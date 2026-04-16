@@ -4,6 +4,9 @@ This module simply re-exports the most important helpers so callers can import
 from one place instead of remembering several lower-level modules.
 """
 
+# Older imports still point here, so this module stays as the stable re-export
+# layer even though the actual implementations live under `protocol/`.
+
 from protocol.command_composer import compose_set_pid_command, format_pid_value
 from protocol.frame_codec import (
     compose_frame,

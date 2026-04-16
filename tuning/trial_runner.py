@@ -16,11 +16,14 @@ from tuning.metrics import score_single_repeat
 from ui.graphing import RuntimeMonitor
 
 
+# Keep trial-runner logging timestamped and consistent with the main script.
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
 
+# Format progress text once here so the monitor sees the same wording from
+# every phase.
 def _candidate_progress_message(
     *,
     phase_name: str | None,
@@ -42,6 +45,8 @@ def _candidate_progress_message(
     return suffix
 
 
+# Categorise repeat failures so later two-strike cancellation logic can reason
+# about repeated bad behaviour rather than one-off noise.
 def _repeat_failure_categories(
     *,
     meta: dict,
@@ -67,6 +72,7 @@ def _repeat_failure_categories(
     return categories, float(regression_pct)
 
 
+# Collapse strike history into one readable cancellation reason.
 def _summarize_strikes(strike_history: dict[str, list[int]]) -> str:
     for category, repeats in strike_history.items():
         if len(repeats) >= 2:
@@ -75,6 +81,10 @@ def _summarize_strikes(strike_history: dict[str, list[int]]) -> str:
     return ""
 
 
+# Orchestrate one full candidate evaluation on real hardware:
+# configure debug output, optionally apply PID values, run repeated START/STOP
+# cycles, collect telemetry, and decide whether the candidate should be
+# cancelled early.
 def run_trial(
     io: SerialLineIO,
     kp: float,
@@ -110,6 +120,7 @@ def run_trial(
     kd = float(np.clip(kd, 0.0, kd_max))
 
     try:
+        # Enable the B0 telemetry/debug stream before any repeats begin.
         io.write_command_expect_ok_ack("000B", command_id_hex2=CMD.SET_DEBUG, timeout=2.0)
         log("SET_DEBUG acknowledged with *00")
     except Exception as exc:
@@ -129,6 +140,8 @@ def run_trial(
 
     sample_interval_s = None
     if current_pid is not None:
+        # Some firmware reports the sample interval in milliseconds, others in
+        # seconds, so normalise it here once.
         raw_si = float(current_pid.get("sample_interval", 0.0))
         if raw_si > 0:
             sample_interval_s = raw_si / 1000.0 if raw_si > 1.0 else raw_si
@@ -152,6 +165,8 @@ def run_trial(
 
     display_kp, display_ki, display_kd = kp, ki, kd
     if (not apply_pid_update) and current_pid is not None:
+        # Baseline trials keep the controller's existing PID, so show that in
+        # the monitor instead of the placeholder zeros used in the caller.
         display_kp = float(current_pid["pw_kp"])
         display_ki = float(current_pid["pw_ki"])
         display_kd = float(current_pid["pw_kd"])
@@ -186,6 +201,8 @@ def run_trial(
     strike_history: dict[str, list[int]] = defaultdict(list)
     tolerated_bad_repeat_logged = False
 
+    # Bring the controller into RUN and open the shutter once for the whole
+    # candidate. Individual repeats then use START/STOP inside that window.
     io.write_command_expect_ok_ack("", command_id_hex2=CMD.RUN, timeout=2.0)
     io.write_command_expect_ok_ack("1", command_id_hex2=CMD.SHUTTER_CONTROL, timeout=2.0)
     log("Shutter opened; waiting 1.0s before sending the next command")
@@ -212,6 +229,8 @@ def run_trial(
             log(f"Test {rep + 1}/{repeats}: START acknowledged")
 
             test_meta = {
+                # Trial metadata carries repeat-level decisions back to the
+                # scorer and bootstrap logic.
                 "invalid": False,
                 "reason": "",
                 "settled": False,
@@ -246,6 +265,8 @@ def run_trial(
                 abs_err = abs(err)
 
                 if not first_seen:
+                    # The first sample is used for the startup skew check before
+                    # the repeat has had any chance to settle.
                     first_seen = True
                     first_power = float(mapped.get("initial_power", y_val))
                     first_err = abs(first_power - desired_output)
@@ -276,6 +297,8 @@ def run_trial(
                     test_meta["settled"] = True
 
                 if test_meta["settled"]:
+                    # Once settled, leaving the +/-5% band invalidates the
+                    # repeat immediately and sends STOP early.
                     if abs_err > limit_5:
                         test_meta["invalid"] = True
                         test_meta["reason"] = (
@@ -297,6 +320,8 @@ def run_trial(
                 return False
 
             def on_waiting_for_first_sample() -> None:
+                # Surface the "armed but not yet receiving telemetry" state in
+                # both logs and the GUI.
                 log(
                     f"Test {rep + 1}/{repeats}: waiting for first telemetry "
                     f"(timeout {startup_telemetry_timeout_s:.2f}s)"
@@ -314,6 +339,8 @@ def run_trial(
                     )
 
             def on_first_sample(startup_delay_s: float, mapped: dict) -> None:
+                # The scored window starts from this first parsed telemetry
+                # packet, not from the START ACK.
                 log(
                     f"Test {rep + 1}/{repeats}: first valid telemetry received after "
                     f"{startup_delay_s:.3f}s (status={mapped.get('status', 'RUNNING')})"
@@ -343,6 +370,8 @@ def run_trial(
                     on_first_sample=on_first_sample,
                 )
             except StartupTelemetryTimeoutError as exc:
+                # Treat missing startup telemetry as an invalid repeat with its
+                # own explicit reason.
                 rt, ry, ru, rs = [], [], [], []
                 test_meta["invalid"] = True
                 test_meta["reason"] = str(exc)
@@ -420,6 +449,8 @@ def run_trial(
             repeat_scores.append(repeat_score)
 
             if ry:
+                # Log a quick summary for the operator without dumping the full
+                # trace.
                 avg_power = float(np.mean(ry))
                 min_power = float(np.min(ry))
                 max_power = float(np.max(ry))
@@ -440,6 +471,7 @@ def run_trial(
                 strike_history[category].append(rep + 1)
 
             if test_meta["unsafe_repeat"]:
+                # Safety aborts always cancel the remaining repeats.
                 cancelled_candidate = True
                 cancel_reason = f"unsafe cancellation: {test_meta['reason'] or 'hardware safety abort'}"
                 test_meta["cancellation_decision"] = cancel_reason
@@ -456,6 +488,8 @@ def run_trial(
                 not cancelled_candidate
                 and valid_repeats + remaining_repeats < min_valid_repeats
             ):
+                # Stop early once it becomes mathematically impossible to finish
+                # with enough valid repeats.
                 cancelled_candidate = True
                 cancel_reason = (
                     "unrecoverable cancellation: "
@@ -490,6 +524,8 @@ def run_trial(
                 log(f"Cancelling remaining repeats for this PID candidate: {cancel_reason}")
                 break
     finally:
+        # Always try to leave the hardware in a safe idle state, even if a
+        # repeat raised midway through collection.
         try:
             io.write_command_expect_ok_ack("", command_id_hex2=CMD.STOP, timeout=2.0)
         except Exception:

@@ -4,16 +4,24 @@ This file is intentionally small: it owns the read loop and leaves protocol
 parsing/mapping to the dedicated protocol/domain layers.
 """
 
+# Keep the collection loop isolated from trial orchestration so serial timing
+# concerns stay in one place.
+
 import time
 
 from protocol.reply_parser import parse_telemetry_line
 from domain.value_mapper import map_telemetry_values
 
 
+# Distinguish "no telemetry ever arrived after START" from a more generic
+# empty-trace failure later in the scoring path.
 class StartupTelemetryTimeoutError(TimeoutError):
     """Raised when no valid telemetry sample arrives after START within the allowed window."""
 
 
+# This loop only knows how to read, parse, and timestamp samples.
+# Higher-level trial code decides what counts as an invalid or early-stopped run
+# through the callbacks.
 def collect_trial_data(
     io,
     *,
@@ -43,6 +51,8 @@ def collect_trial_data(
     # We build plain Python lists first because append-in-a-loop is fast/safe.
     t_vals, y_vals, u_vals, status_vals = [], [], [], []
     sample_idx = 0
+    # Do not start the scored window until a real telemetry sample has been
+    # parsed successfully.
     t_start = None
     wait_started_at = time.monotonic()
     first_sample_time_s = None
@@ -76,6 +86,8 @@ def collect_trial_data(
             mapped = map_telemetry_values(telemetry)
             mapped_t = mapped.get("time_s")
             if t_start is None:
+                # First parsed sample flips the collector from "arming" into
+                # "timed capture" mode.
                 t_start = time.monotonic()
                 if mapped_t is not None:
                     first_sample_time_s = float(mapped_t)
@@ -93,6 +105,7 @@ def collect_trial_data(
             else:
                 if first_sample_time_s is None:
                     first_sample_time_s = float(mapped_t)
+                # Rebase device timestamps so the measured window starts at 0.
                 t_val = float(mapped_t) - float(first_sample_time_s)
 
             t_vals.append(t_val)
@@ -120,4 +133,6 @@ def collect_trial_data(
         if line_s.startswith("ERR"):
             raise RuntimeError(line_s)
 
+    # Leave conversion to numpy arrays to the caller so this helper stays
+    # lightweight and easy to test.
     return t_vals, y_vals, u_vals, status_vals

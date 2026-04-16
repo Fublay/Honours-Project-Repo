@@ -49,15 +49,20 @@ from tuning.trial_runner import run_trial
 from ui.graphing import RuntimeMonitor, prompt_launch_gui, run_graph_tool
 
 
+# Dedicated exception for the "stop optimisation because nothing has improved
+# for long enough" path.
 class EarlyStopOptimization(RuntimeError):
     pass
 
 
+# Match the timestamped logging style used by the lower-level modules.
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
 
+# Build CSV fieldnames from the rows that actually exist so optional metrics do
+# not need to be duplicated in several hard-coded lists.
 def ordered_row_fieldnames(rows: list[dict], fallback: list[str]) -> list[str]:
     """Preserve first-seen key order while including keys from every row."""
     if not rows:
@@ -72,6 +77,7 @@ def ordered_row_fieldnames(rows: list[dict], fallback: list[str]) -> list[str]:
     return fieldnames
 
 
+# Console launcher fallback when the Tk startup dialog is not being used.
 def prompt_launch_action() -> str:
     while True:
         choice = input("Choose action: [s]tart test, [r]eset defaults, [g]raph power, or [q]uit: ").strip().lower()
@@ -86,6 +92,7 @@ def prompt_launch_action() -> str:
         print("Please enter s, r, g, or q.", flush=True)
 
 
+# Input helpers keep startup validation out of the main orchestration flow.
 def prompt_goal_power_output(default_value: float) -> float:
     while True:
         raw = input(f"Enter goal power output [{default_value}]: ").strip()
@@ -97,6 +104,7 @@ def prompt_goal_power_output(default_value: float) -> float:
             print("Please enter a numeric value.", flush=True)
 
 
+# Trial-count prompt shared by the non-GUI startup path.
 def prompt_trial_count(default_value: int) -> int:
     while True:
         raw = input(f"Enter number of trials [{default_value}]: ").strip()
@@ -112,6 +120,7 @@ def prompt_trial_count(default_value: int) -> int:
             print("Please enter an integer value.", flush=True)
 
 
+# Frequency prompt shared by the non-GUI startup path.
 def prompt_frequency_khz(default_value: int) -> int:
     while True:
         raw = input(f"Enter frequency in kHz [{default_value}]: ").strip()
@@ -127,6 +136,7 @@ def prompt_frequency_khz(default_value: int) -> int:
             print("Please enter an integer value.", flush=True)
 
 
+# Push the one-time program setup used before any firing starts.
 def configure_program(io: SerialLineIO, *, power_w: float, frequency_khz: int) -> None:
     """Send the one-time program setup command before trial startup."""
     current_program = None
@@ -159,6 +169,8 @@ def configure_program(io: SerialLineIO, *, power_w: float, frequency_khz: int) -
         raise RuntimeError(f"SET_PROGRAM returned error code: {ack}")
 
 
+# Pull launcher defaults from the connected hardware when possible so the UI
+# reflects the real controller state.
 def get_program_defaults(io: SerialLineIO, *, fallback_power_w: float, fallback_frequency_khz: int) -> tuple[float, int]:
     """Read the current program and use it to seed power/frequency defaults."""
     try:
@@ -176,6 +188,7 @@ def get_program_defaults(io: SerialLineIO, *, fallback_power_w: float, fallback_
         return float(fallback_power_w), int(fallback_frequency_khz)
 
 
+# Manual reset path exposed from the launcher.
 def reset_pid_defaults(io: SerialLineIO) -> None:
     """Write known-safe default PID values back to the controller."""
     ack = io.set_pid_values(
@@ -197,6 +210,7 @@ def reset_pid_defaults(io: SerialLineIO) -> None:
         raise RuntimeError(f"Reset returned error code: {ack}")
 
 
+# Build the multi-line bootstrap status text shown in the live monitor.
 def format_readiness_status(
     *,
     bootstrap_status: dict | None,
@@ -210,6 +224,8 @@ def format_readiness_status(
 ) -> str:
     """Build a short GUI checklist for bootstrap readiness."""
 
+    # Keep the checklist-style display explicit so the operator can see at a
+    # glance which bootstrap gate is still blocking progress.
     def mark(done: bool) -> str:
         return "[x]" if done else "[ ]"
 
@@ -248,6 +264,7 @@ def format_readiness_status(
     local_spans = tuple(region_status.get("local_spans", (0.0, 0.0, 0.0)))
     local_counts = tuple(region_status.get("local_unique_counts", (0, 0, 0)))
 
+    # The first few lines are the headline summary shown in the monitor.
     lines = [
         "Bootstrap readiness:",
         bootstrap_line,
@@ -269,6 +286,8 @@ def format_readiness_status(
 
     axis_statuses = list(region_status.get("axis_statuses", []))
     if axis_statuses:
+        # Keep the per-axis breakdown underneath the headline summary so the UI
+        # still exposes the "why" behind a blocked bootstrap state.
         lines.append("Secondary diagnostic:")
         for status in axis_statuses:
             lines.append(
@@ -284,6 +303,7 @@ def format_readiness_status(
     return "\n".join(lines)
 
 
+# Describe how the latest bootstrap move differs from the previous base point.
 def format_warmup_change_message(
     base_pid: tuple[float, float, float] | None,
     candidate_pid: tuple[float, float, float] | None,
@@ -303,6 +323,7 @@ def format_warmup_change_message(
     )
 
 
+# Summarise the most recent bootstrap result in operator-facing language.
 def format_previous_warmup_result_message(
     *,
     score: float,
@@ -317,6 +338,8 @@ def format_previous_warmup_result_message(
     good_score_factor: float,
 ) -> str:
     """Summarise whether the last bootstrap candidate passed and why it failed."""
+    # Collect every blocking reason first, then collapse them into one monitor
+    # string.
     reasons: list[str] = []
     if cancelled_candidate:
         reasons.append(cancel_reason or "remaining repeats cancelled")
@@ -338,6 +361,8 @@ def format_previous_warmup_result_message(
 
     tolerated = []
     for idx, meta in enumerate(per_test_meta, start=1):
+        # These are failure categories that occurred but were not severe enough
+        # to cancel the candidate outright.
         cats = list(meta.get("failure_categories", []))
         if cats and not meta.get("cancellation_decision"):
             tolerated.append(f"repeat {idx}: {', '.join(cats)} tolerated")
@@ -355,6 +380,7 @@ def format_previous_warmup_result_message(
     )
 
 
+# Compact labels for the live monitor's current-phase display.
 def format_phase_display(mode: str) -> str:
     if mode == "validation":
         return "VALIDATION"
@@ -363,6 +389,7 @@ def format_phase_display(mode: str) -> str:
     return "BOOTSTRAP"
 
 
+# Human-readable label for the mechanism that proposed the current candidate.
 def format_candidate_source(mode: str) -> str:
     if mode == "surrogate":
         return "surrogate (predicted best)"
@@ -377,6 +404,7 @@ def format_candidate_source(mode: str) -> str:
     return "bootstrap"
 
 
+# Show how far a candidate moved from the reference PID.
 def format_pid_delta(
     candidate_pid: tuple[float, float, float],
     reference_pid: tuple[float, float, float] | None,
@@ -390,6 +418,7 @@ def format_pid_delta(
     )
 
 
+# Build one short sentence explaining why this candidate is being run.
 def build_candidate_reason(
     source: str,
     *,
@@ -401,6 +430,8 @@ def build_candidate_reason(
     base = f"Testing candidate from {source}"
 
     if best_pid is not None:
+        # Show movement relative to the current best point so the operator can
+        # tell whether the search is exploring or tightening locally.
         dk = float(kp) - float(best_pid[0])
         di = float(ki) - float(best_pid[1])
         dd = float(kd) - float(best_pid[2])
@@ -419,6 +450,8 @@ def build_candidate_reason(
     return base
 
 
+# Translate a mode into displayed totals and which phase counters should
+# advance in the monitor.
 def counted_trial_totals(*, mode: str, n_trials: int, validation_trials: int) -> tuple[int | None, int, int, int]:
     if mode == "validation":
         return int(validation_trials), 0, 0, 1
@@ -427,10 +460,16 @@ def counted_trial_totals(*, mode: str, n_trials: int, validation_trials: int) ->
     return int(n_trials), 0, 1, 0
 
 
+# Top-level application flow.
+# This owns argument parsing, serial setup, launcher interaction, bootstrap,
+# optimisation, validation, CSV export, and final reporting.
 def main() -> None:
     import argparse
 
+    # Most knobs are surfaced here so real-hardware runs can be adjusted without
+    # editing code in the middle of an experiment.
     ap = argparse.ArgumentParser()
+    # Hardware/serial connection.
     ap.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--iters", type=int, default=20, help="Number of tuning trials")
@@ -439,6 +478,7 @@ def main() -> None:
     ap.add_argument("--kp-max", type=float, default=1.0, help="Upper limit for Kp search/clamp")
     ap.add_argument("--ki-max", type=float, default=1.0, help="Upper limit for Ki search/clamp")
     ap.add_argument("--kd-max", type=float, default=0.2, help="Upper limit for Kd search/clamp")
+    # Core target and scoring weights.
     ap.add_argument("--desired-output", type=float, default=525.0, help="Target output value for scoring")
     ap.add_argument("--w-start", type=float, default=0.25, help="Weight: start power error")
     ap.add_argument("--w-track", type=float, default=0.60, help="Weight: average tracking error before hold quality takes over")
@@ -457,6 +497,7 @@ def main() -> None:
     ap.add_argument("--w-post-var", type=float, default=6.0, help="Weight: post-settle variance")
     ap.add_argument("--w-hold", type=float, default=5.0, help="Weight: explicit final hold-quality penalty")
     ap.add_argument("--invalid-penalty", type=float, default=800.0, help="Penalty multiplier for invalid tests")
+    # Trial validity and repeat-level safety heuristics.
     ap.add_argument("--startup-grace-s", type=float, default=2.0, help="Seconds to ignore startup overshoot")
     ap.add_argument(
         "--startup-telemetry-timeout-s",
@@ -465,11 +506,13 @@ def main() -> None:
         help="Maximum seconds to wait after START for the first valid telemetry packet",
     )
     ap.add_argument("--settled-window-samples", type=int, default=5, help="Consecutive in-band samples to mark settled")
+    # Search-step controls.
     ap.add_argument("--max-step-kp", type=float, default=0.15, help="Max per-trial change in Kp")
     ap.add_argument("--max-step-ki", type=float, default=0.15, help="Max per-trial change in Ki")
     ap.add_argument("--max-step-kd", type=float, default=0.05, help="Max per-trial change in Kd")
     ap.add_argument("--step-shrink-factor", type=float, default=0.85, help="Step multiplier on new best score")
     ap.add_argument("--step-growth-factor", type=float, default=1.05, help="Step multiplier when not improving")
+    # Bootstrap readiness thresholds.
     ap.add_argument(
         "--coordinate-warmup-trials",
         type=int,
@@ -521,6 +564,7 @@ def main() -> None:
         default=0.30,
         help="Maximum oscillation rate a bootstrap trial can have and still count as safe",
     )
+    # Repeat-cancellation heuristics.
     ap.add_argument(
         "--repeat-cancel-osc-threshold",
         type=float,
@@ -539,6 +583,7 @@ def main() -> None:
         default=20.0,
         help="If best improvement >= this, stop increasing step sizes on misses",
     )
+    # Phase-management and refinement controls.
     ap.add_argument("--early-stop-patience", type=int, default=12, help="Stop after N non-improving trials")
     ap.add_argument("--retest-best-every", type=int, default=0, help="Every N trials, re-run current best PID for verification (0 disables)")
     ap.add_argument("--refine-activate-improve-pct", type=float, default=25.0, help="Enable local refinement bounds after this best-improvement percentage")
@@ -551,6 +596,7 @@ def main() -> None:
     ap.add_argument("--warmup-repeats", type=int, default=3, help="Number of repeated tests per candidate during bootstrap")
     ap.add_argument("--bo-repeats", type=int, default=5, help="Number of repeated tests per candidate during optimisation")
     ap.add_argument("--frequency-khz", type=int, default=0, help="Laser frequency in kHz for the startup program command")
+    # Surrogate / BO settings.
     ap.add_argument(
         "--surrogate-model",
         choices=("extra_trees", "random_forest", "none"),
@@ -573,6 +619,8 @@ def main() -> None:
     ap.add_argument("--validation-repeats", type=int, default=5, help="Number of repeated tests per validation candidate")
     args = ap.parse_args()
 
+    # Ask the controller for its current program values up front so the startup
+    # UI can default to something that matches the connected hardware.
     default_goal = float(args.desired_output)
     default_frequency_khz = int(args.frequency_khz)
     if args.port:
@@ -596,6 +644,8 @@ def main() -> None:
             if startup_ser is not None:
                 startup_ser.close()
 
+    # Outer loop lets the launcher return to the main menu after graphing or a
+    # reset without restarting the whole process.
     root = None
     while True:
         action = None
@@ -605,6 +655,8 @@ def main() -> None:
         frequency_khz = None
         monitor = None
 
+        # Prefer the Tk launcher when available, but keep a console path for
+        # headless or dependency-light environments.
         if not args.no_gui:
             ui = prompt_launch_gui(default_goal, args.iters, args.test_duration_s, default_frequency_khz, root=root)
             if ui is not None:
@@ -620,12 +672,14 @@ def main() -> None:
                 log("GUI unavailable; falling back to console prompts.")
 
         if action is None:
+            # Console flow only fills the fields it is responsible for.
             action = prompt_launch_action()
             if action == "start":
                 desired_output = prompt_goal_power_output(default_goal)
                 n_trials = prompt_trial_count(args.iters)
                 frequency_khz = prompt_frequency_khz(default_frequency_khz)
 
+        # `graph` and `reset` short-circuit before the expensive tuning flow.
         if action == "quit":
             log("Exiting on user request.")
             return
@@ -640,6 +694,8 @@ def main() -> None:
         if not args.port:
             raise SystemExit("--port is required for start and reset actions")
 
+        # Only open the real serial link once the user has picked an action that
+        # truly needs hardware access.
         log("Opening serial port")
         ser = serial.Serial(args.port, args.baud, timeout=0.1)
         io = SerialLineIO(
@@ -655,6 +711,7 @@ def main() -> None:
                 log("Defaults restored successfully. Returning to main menu.")
                 continue
 
+            # Fill in any values the launcher path did not already provide.
             if desired_output is None:
                 desired_output = prompt_goal_power_output(default_goal)
             log(f"Goal power output set to {desired_output:.4f}")
@@ -670,6 +727,8 @@ def main() -> None:
             log(f"Configured frequency: {frequency_khz} kHz")
 
             if monitor is not None:
+                # The monitor starts in bootstrap mode even though the baseline
+                # trial will still use the controller's current PID.
                 monitor.set_target(desired_output)
                 monitor.set_phase("BOOTSTRAP")
                 monitor.set_status("Sending startup program command")
@@ -685,10 +744,14 @@ def main() -> None:
             if monitor is not None:
                 monitor.set_status("Program setup applied")
 
+            # These collections accumulate the whole run and are written to CSV
+            # once the tuning session finishes.
             duration = 15.0
             history: list[dict] = []
             power_rows: list[tuple] = []
             trace_feature_rows: list[dict] = []
+            # Trial counters are split by phase because some phases are counted
+            # against the user's optimisation budget and others are not.
             trial_index = 0
             bootstrap_trial_count = 0
             optimisation_trial_count = 0
@@ -710,6 +773,7 @@ def main() -> None:
             min_step_kd = max(0.005, step_kd * 0.1)
             axis_index = 0
             axis_directions = [1.0, 1.0, 1.0]
+            # These point clouds are the bootstrap search state.
             safe_trial_points: list[tuple[float, float, float]] = []
             good_trial_points: list[tuple[float, float, float]] = []
             unsafe_trial_points: list[tuple[float, float, float]] = []
@@ -722,6 +786,8 @@ def main() -> None:
             bootstrap_target = max(1, int(args.coordinate_warmup_trials))
             max_bootstrap_trials = max(bootstrap_target, int(args.max_bootstrap_trials))
 
+            # Bootstrap starts with an empty picture of the safe region and
+            # updates this status after every candidate.
             region_status = assess_local_safe_region(
                 safe_trial_points,
                 good_trial_points,
@@ -766,7 +832,11 @@ def main() -> None:
                     )
                 )
 
+            # Small local helpers keep the main phase loop readable without
+            # pushing single-use glue into separate modules.
             def refinement_center_pid() -> tuple[float, float, float] | None:
+                # Refinement phases are centered on the best safe point when
+                # available, otherwise the last PID that was actually applied.
                 if best_pid is not None:
                     return tuple(float(v) for v in best_pid)
                 if last_applied is not None:
@@ -774,6 +844,7 @@ def main() -> None:
                 return None
 
             def local_refinement_bounds() -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None:
+                # Bounds only exist once there is a meaningful centre point.
                 center_pid = refinement_center_pid()
                 if center_pid is None:
                     return None
@@ -792,6 +863,8 @@ def main() -> None:
                 current_step_ki: float,
                 current_step_kd: float,
             ) -> tuple[float, float, float]:
+                # Reuse the search helper so local-step scaling stays consistent
+                # with the standalone refinement utilities.
                 return compute_refinement_step_sizes(
                     step_kp=current_step_kp,
                     step_ki=current_step_ki,
@@ -803,6 +876,8 @@ def main() -> None:
                 )
 
             def local_refinement_step_floor() -> tuple[float, float, float]:
+                # Floor values stop the refinement steps from collapsing all the
+                # way to zero after repeated improvements.
                 return compute_refinement_step_sizes(
                     step_kp=min_step_kp,
                     step_ki=min_step_ki,
@@ -818,6 +893,8 @@ def main() -> None:
                 step_kp, step_ki, step_kd = local_refinement_step_sizes(step_kp, step_ki, step_kd)
 
             def mode_to_phase(mode: str) -> str:
+                # Several candidate-selection modes still belong to the same
+                # user-visible phase.
                 if mode == "validation":
                     return "validation"
                 if mode == "warmup":
@@ -846,6 +923,7 @@ def main() -> None:
                 best_improve_vs_base_pct: float,
                 phase_trial_index: int,
             ) -> None:
+                # History rows are one-per-candidate summaries.
                 bootstrap_used = int(bootstrap_trial_count + (1 if phase == "bootstrap" else 0))
                 optimisation_used = int(optimisation_trial_count + (1 if phase == "optimisation" else 0))
                 validation_used = int(validation_trial_count + (1 if phase == "validation" else 0))
@@ -875,6 +953,8 @@ def main() -> None:
                 history_row.update(metrics)
                 history.append(history_row)
 
+                # Trace-feature rows preserve per-repeat detail for later
+                # analysis without duplicating every power sample.
                 for repeat_idx, (test_meta, repeat_feature) in enumerate(zip(per_test_meta, repeat_features), start=1):
                     trace_feature_rows.append(
                         {
@@ -905,6 +985,8 @@ def main() -> None:
                 for test_idx, (test_powers, test_times, test_meta) in enumerate(zip(per_test_powers, per_test_times, per_test_meta), start=1):
                     if test_powers.size == 0:
                         continue
+                    # Power rows preserve the raw-ish sample stream used by the
+                    # offline graph tools.
                     time_vals = test_times.tolist() if test_times.size == test_powers.size else list(range(int(test_powers.size)))
                     for sample_idx, (t_s, power_val) in enumerate(zip(time_vals, test_powers.tolist()), start=1):
                         power_rows.append(
@@ -946,6 +1028,8 @@ def main() -> None:
                 nonlocal no_improve_count, step_kp, step_ki, step_kd, axis_index, surrogate_active
                 nonlocal region_status, bootstrap_status
 
+                # Derive all bookkeeping labels for this candidate before the
+                # hardware run starts.
                 phase = mode_to_phase(mode)
                 is_warmup_mode = mode == "warmup"
                 is_surrogate_mode = mode.startswith("surrogate")
@@ -994,6 +1078,8 @@ def main() -> None:
                     1,
                     int(args.warmup_repeats if is_warmup_mode else args.validation_repeats if is_validation_mode else args.bo_repeats),
                 )
+                # Log the operator-facing trial identity before anything touches
+                # the controller.
                 log(
                     f"{display_phase_name} trial {display_phase_index}"
                     + (f"/{display_phase_total}" if display_phase_total is not None else "")
@@ -1007,6 +1093,8 @@ def main() -> None:
                 )
 
                 if monitor is not None:
+                    # Keep the monitor synchronized with the candidate source
+                    # and trial counters before the PID update happens.
                     monitor.set_phase(format_phase_display(mode))
                     monitor.set_candidate_source(format_candidate_source(mode))
                     monitor.set_candidate_reason(selection_reason)
@@ -1045,6 +1133,8 @@ def main() -> None:
                     log(f"{display_phase_name} candidate -> kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
 
                 if monitor is not None:
+                    # The readiness panel should always reflect the PID that is
+                    # about to run on the controller, not just the proposed PID.
                     current_controller_pid = candidate_pid if apply_pid_update else last_applied
                     monitor.set_readiness(
                         format_readiness_status(
@@ -1088,6 +1178,8 @@ def main() -> None:
 
                 used_kp, used_ki, used_kd = kp, ki, kd
                 if trial_index == 0 and current_pid is not None:
+                    # Baseline keeps the controller's current PID, so the
+                    # recorded values must come back from the device.
                     used_kp = float(current_pid["pw_kp"])
                     used_ki = float(current_pid["pw_ki"])
                     used_kd = float(current_pid["pw_kd"])
@@ -1133,12 +1225,18 @@ def main() -> None:
 
                 prev_best_score = best_score_seen
                 if baseline_score is None:
+                    # The first completed trial becomes the baseline reference
+                    # for later relative-improvement reporting.
                     baseline_score = score
                 improved = score < prev_best_score
                 if not is_validation_mode:
+                    # Validation re-runs should not move the search state or
+                    # change the "best" bookkeeping.
                     best_score_seen = min(best_score_seen, score)
                     local_floor_kp, local_floor_ki, local_floor_kd = local_refinement_step_floor()
                     if improved:
+                        # Improvements shrink the step sizes toward a more local
+                        # search.
                         best_pid = (used_kp, used_ki, used_kd)
                         best_metrics = dict(metrics)
                         no_improve_count = 0
@@ -1152,6 +1250,8 @@ def main() -> None:
                             step_ki = max(min_step_ki, step_ki * float(args.step_shrink_factor))
                             step_kd = max(min_step_kd, step_kd * float(args.step_shrink_factor))
                     else:
+                        # Misses count against patience and may flip coordinate
+                        # search direction on the affected axis.
                         no_improve_count += 1
                         if used_axis is not None:
                             axis_directions[used_axis] *= -1.0
@@ -1180,6 +1280,8 @@ def main() -> None:
                     best_improve_vs_base_pct = 0.0
 
                 if apply_pid_update and not is_validation_mode:
+                    # Only true search candidates feed the bootstrap point clouds
+                    # and surrogate training set.
                     observed_points.append((used_kp, used_ki, used_kd))
                     observed_scores.append(score)
                     surrogate_training_rows.append(
@@ -1248,6 +1350,8 @@ def main() -> None:
                         f"variation_axes={region_status.get('local_variation_axes', 0)}/3"
                     )
                     if monitor is not None:
+                        # Refresh every bootstrap-facing monitor panel after each
+                        # new candidate result.
                         monitor.set_axis_coverage(region_status["axis_statuses"])
                         monitor.set_warmup_counter(
                             f"Bootstrap: {bootstrap_done} trials run | "
@@ -1289,6 +1393,8 @@ def main() -> None:
                     if args.surrogate_model != "none" and (
                         len(surrogate_training_rows) % max(1, int(args.surrogate_retrain_every)) == 0
                     ):
+                        # Refit the surrogate periodically rather than after
+                        # every candidate if the user asks for that.
                         surrogate_active = surrogate.fit(
                             surrogate_training_rows,
                             min_samples=max(int(args.surrogate_min_samples), int(args.bayes_min_safe_trials)),
@@ -1349,6 +1455,8 @@ def main() -> None:
                     log(f"Candidate repeats cancelled early: {cancel_reason}")
 
                 trial_index += 1
+                # Update phase-specific counters after logging so the history
+                # row reflects the candidate that just ran.
                 if is_warmup_mode:
                     bootstrap_trial_count += 1
                 elif is_validation_mode:
@@ -1376,13 +1484,19 @@ def main() -> None:
                     evaluate_candidate(best_pid[0], best_pid[1], best_pid[2], mode="validation")
 
                 if (not is_validation_mode) and args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
+                    # Bubble out to the surrounding phase logic once patience is
+                    # exhausted.
                     raise EarlyStopOptimization(
                         f"No score improvement for {no_improve_count} trials (patience={args.early_stop_patience})"
                     )
                 return score
 
+            # Bootstrap explores one axis at a time, choosing whichever axis is
+            # currently least understood near the best point.
             def run_coordinate_trial() -> float:
                 nonlocal axis_index
+                # Bootstrap uses the best safe PID so far as its centre once one
+                # exists; until then it grows outward from the hardware baseline.
                 base_pid = best_pid if best_pid is not None else last_applied
                 used_axis = None
                 candidate_delta = 0.0
@@ -1434,6 +1548,7 @@ def main() -> None:
                             format_warmup_change_message(base_pid, (kp, ki, kd), used_axis, candidate_delta)
                         )
                 else:
+                    # Trial zero is always the baseline read-only run.
                     kp, ki, kd = 0.0, 0.0, 0.0
                     if monitor is not None:
                         monitor.set_warmup_change(format_warmup_change_message(None, (kp, ki, kd), None, 0.0))
@@ -1443,7 +1558,11 @@ def main() -> None:
                     axis_index = (used_axis + 1) % 3
                 return score
 
+            # Surrogate-guided optimisation samples inside the current local
+            # refinement box.
             def run_surrogate_trial() -> float:
+                # Keep surrogate proposals inside the local refinement box once
+                # bootstrap has declared that box safe enough to search.
                 bounds = local_refinement_bounds()
                 local_step_kp, local_step_ki, local_step_kd = local_refinement_step_sizes(step_kp, step_ki, step_kd)
                 candidate, predicted, proposal_mode = propose_surrogate_candidate(
@@ -1474,6 +1593,8 @@ def main() -> None:
                     surrogate_enabled=True,
                 )
 
+            # If the surrogate or BO layers cannot fill the budget, finish with
+            # bounded local coordinate steps.
             def run_fallback_trial() -> float:
                 nonlocal axis_index
                 bounds = local_refinement_bounds()
@@ -1481,6 +1602,8 @@ def main() -> None:
                 if base_pid is None:
                     base_pid = (0.0, 0.0, 0.0)
                 base_pid = clamp_pid_to_bounds(base_pid, bounds)
+                # Fallback search is still local and bounded, just without the
+                # surrogate or BO machinery choosing the next point.
                 local_step_kp, local_step_ki, local_step_kd = local_refinement_step_sizes(step_kp, step_ki, step_kd)
                 (kp, ki, kd), used_axis, _, candidate_delta = propose_coordinate_candidate(
                     base_pid,
@@ -1518,6 +1641,8 @@ def main() -> None:
                 axis_index = (used_axis + 1) % 3
                 return score
 
+            # Run bootstrap first to find a stable local region before any
+            # higher-order optimisation kicks in.
             log("Starting bootstrap search for a stable local safe region")
             if monitor is not None:
                 monitor.set_phase(format_phase_display("warmup"))
@@ -1528,6 +1653,9 @@ def main() -> None:
                     run_coordinate_trial()
 
                 if bool(bootstrap_status["ready"]):
+                    # Once bootstrap has a safe local region, split the
+                    # remaining counted budget across surrogate, optional BO,
+                    # and fallback local refinement.
                     no_improve_count = 0
                     clamp_refinement_steps()
                     surrogate_budget = max(0, int(n_trials) - max(0, int(args.bo_refine_trials)))
@@ -1564,6 +1692,8 @@ def main() -> None:
                         )
 
                     if args.surrogate_model != "none":
+                        # Try to bring the surrogate online as soon as bootstrap
+                        # is complete and enough data exists.
                         surrogate_active = surrogate.fit(
                             surrogate_training_rows,
                             min_samples=max(int(args.surrogate_min_samples), int(args.bayes_min_safe_trials)),
@@ -1576,6 +1706,8 @@ def main() -> None:
 
                     optimisation_trials_run = 0
                     if surrogate_active and surrogate_budget > 0:
+                        # Use the learned model first while the local box is
+                        # fresh and well defined.
                         if monitor is not None:
                             monitor.set_phase(format_phase_display("surrogate"))
                             monitor.set_candidate_source(format_candidate_source("surrogate"))
@@ -1587,6 +1719,8 @@ def main() -> None:
 
                     remaining_after_surrogate = max(0, int(n_trials) - optimisation_trials_run)
                     if remaining_after_surrogate > 0 and bo_budget > 0 and HAVE_SKOPT:
+                        # Optional BO phase stays inside the same local safe box
+                        # that bootstrap established.
                         bo_calls = min(bo_budget, remaining_after_surrogate)
                         log(f"Starting BO refinement for {bo_calls} trial(s)")
                         if monitor is not None:
@@ -1607,6 +1741,9 @@ def main() -> None:
                         )
                         seed_points, seed_scores = filter_seed_points_for_space(observed_points, observed_scores, bayes_space)
                         gp_minimize(
+                            # gp_minimize still delegates each expensive
+                            # function evaluation back into the same candidate
+                            # execution pipeline.
                             lambda x: evaluate_candidate(
                                 float(x[0]),
                                 float(x[1]),
@@ -1626,12 +1763,16 @@ def main() -> None:
                     elif remaining_after_surrogate > 0 and bo_budget > 0 and not HAVE_SKOPT:
                         log("BO refinement unavailable because scikit-optimize is not installed")
 
+                    # Spend any leftover counted trials on deterministic local
+                    # refinement steps.
                     remaining_after_bo = max(0, int(n_trials) - optimisation_trials_run)
                     while remaining_after_bo > 0:
                         log("Using local fallback refinement for remaining optimisation budget")
                         run_fallback_trial()
                         remaining_after_bo -= 1
                 else:
+                    # If bootstrap never established a safe local region, stop
+                    # before any optimisation phases begin.
                     log(
                         "Optimisation phases skipped: "
                         f"no stable local safe region found after {bootstrap_trial_count} bootstrap trials "
@@ -1656,6 +1797,8 @@ def main() -> None:
             except EarlyStopOptimization as exc:
                 log(f"Early stop: {exc}")
 
+            # Final validation only runs after at least one optimisation trial,
+            # and only when there is a concrete best PID to re-test.
             if bool(region_status["ready"]) and best_pid is not None and int(args.validation_trials) > 0 and optimisation_trial_count > 0:
                 log(f"Starting validation phase for {int(args.validation_trials)} trial(s)")
                 if monitor is not None:
@@ -1696,6 +1839,8 @@ def main() -> None:
                 f"bootstrap={bootstrap_trial_count}, optimisation={optimisation_trial_count}, validation={validation_trial_count}"
             )
 
+            # Write the trial-level summary CSV first; this is the main artefact
+            # used for quick post-run inspection.
             with open("tuning_history.csv", "w", newline="") as f:
                 fieldnames = ordered_row_fieldnames(
                     history,
@@ -1719,6 +1864,8 @@ def main() -> None:
                 writer.writerows(history)
             log("Saved tuning_history.csv")
 
+            # Per-repeat derived features are split out so history rows stay
+            # compact.
             with open("tuning_trace_features.csv", "w", newline="") as f:
                 fieldnames = ordered_row_fieldnames(
                     trace_feature_rows,
@@ -1737,6 +1884,9 @@ def main() -> None:
                 writer.writerows(trace_feature_rows)
             log("Saved tuning_trace_features.csv")
 
+            # Persist the full sample-level trace separately from the
+            # trial-level history so later graphing can reconstruct individual
+            # repeats.
             with open("tuning_power_readings.csv", "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(
@@ -1766,6 +1916,7 @@ def main() -> None:
             if monitor is not None:
                 monitor.mark_complete("Optimisation complete. Returning to main menu.")
         finally:
+            # Always close the serial handle before looping back to the launcher.
             ser.close()
 
 

@@ -4,12 +4,17 @@ The firmware protocol uses text frames with this shape:
     $<cmd><payload><checksum>\r\n
 """
 
+# This module is the wire-format choke point.
+# Anything that sends or validates controller frames should come through here.
+
 import re
 
 
+# Cheap structural guard before deeper parsing.
 FRAME_RE = re.compile(r"^\$[^\r\n]*\r\n$")
 
 
+# Fast validation helper used by the higher-level reply parsers.
 def is_framed_command(packet: str) -> bool:
     """
     Returns True only for packets framed as "$...\\r\\n".
@@ -17,6 +22,8 @@ def is_framed_command(packet: str) -> bool:
     return isinstance(packet, str) and FRAME_RE.fullmatch(packet) is not None
 
 
+# Match the controller's checksum rules exactly, including the fact that the
+# command prefix is excluded from the summed data portion.
 def default_checksum_hex_2(frame_without_checksum: bytes) -> str:
     """Compute protocol checksum as 8-bit sum over payload characters."""
     if not isinstance(frame_without_checksum, (bytes, bytearray)):
@@ -29,6 +36,7 @@ def default_checksum_hex_2(frame_without_checksum: bytes) -> str:
     return f"{checksum:02X}"
 
 
+# Central frame builder used by all command paths.
 def compose_frame(command_id_hex2: str, data: str, checksum_fn=default_checksum_hex_2) -> bytes:
     """
     Compose a framed command according to:
@@ -54,6 +62,8 @@ def compose_frame(command_id_hex2: str, data: str, checksum_fn=default_checksum_
     return frame_wo_checksum + checksum.encode("ascii") + b"\r\n"
 
 
+# Shared reply validator for callers that need the raw payload after checksum
+# verification.
 def parse_reply(packet: str) -> tuple[int, str]:
     """
     Parse and validate a reply frame.
@@ -72,6 +82,8 @@ def parse_reply(packet: str) -> tuple[int, str]:
     received_checksum_str = pkt[-2:]
 
     # 'FF' uses an extended 4-hex command identifier format.
+    # Normal commands are two hex digits, but this branch keeps extended frames
+    # from being mis-parsed as ordinary replies.
     if cmd_str == "FF":
         if len(pkt) < 10:
             raise ValueError("Invalid FF command format")

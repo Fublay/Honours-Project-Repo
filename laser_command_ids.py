@@ -4,6 +4,9 @@ Command ID registry for the laser serial protocol.
 Based on Power Feedback systems RS232 protocol.
 """
 
+# Keep raw wire IDs in one file so the rest of the code can refer to readable
+# names instead of scattering bare hex strings around the repo.
+
 # PID configuration commands.
 # These are used to read/write tuning parameters from the laser firmware.
 DEBUG = "B0"

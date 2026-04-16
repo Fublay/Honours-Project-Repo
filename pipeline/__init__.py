@@ -3,3 +3,5 @@
 A "pipeline" here means the ordered steps that read serial lines, parse them,
 and return clean arrays that scoring/optimization code can use.
 """
+
+# Package marker only.

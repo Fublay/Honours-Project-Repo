@@ -4,7 +4,11 @@ The optimization/scoring code expects a single dictionary format no matter
 which telemetry packet type the laser emitted.
 """
 
+# This is the normalization point between parser quirks and the rest of the
+# tuning stack.
 
+# Every downstream consumer expects these keys, no matter which telemetry shape
+# arrived from the controller.
 def map_telemetry_values(raw: dict) -> dict:
     """Normalize one telemetry sample into fields the rest of the app uses.
 

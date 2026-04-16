@@ -4,9 +4,14 @@ This module focuses on formatting rules the firmware expects, especially the
 fixed-width PID fields used by SET_PID.
 """
 
+# Keep protocol formatting rules here so the rest of the application can work in
+# plain floats and ints instead of hand-building payload strings.
+
 from protocol.frame_codec import compose_frame, default_checksum_hex_2
 
 
+# The firmware is picky about width, precision, and spacing.
+# Changing this formatting changes the wire protocol.
 def format_pid_value(value: float, field_width: int = 8) -> str:
     """Convert a number to the exact text layout expected by the laser.
 
@@ -26,6 +31,8 @@ def format_pid_value(value: float, field_width: int = 8) -> str:
     return f"{formatted:>{field_width}}"
 
 
+# Merge caller overrides with either live hardware values or local defaults, and
+# only then build the final fixed-width payload.
 def compose_set_pid_command(
     pw_kp: float,
     pw_ki: float,
@@ -70,6 +77,9 @@ def compose_set_pid_command(
     return compose_frame("B5", data, checksum_fn=checksum_fn)
 
 
+# Program writes use a different packed decimal layout from PID writes.
+# Keep the range checks next to the formatter so bad values fail before they
+# reach the controller.
 def compose_set_program_command(
     *,
     power_w: float | None = None,
@@ -82,6 +92,8 @@ def compose_set_program_command(
 ) -> bytes:
     """Create one complete SET_PROGRAM command frame ready to send on serial."""
     if current_values:
+        # Read-modify-write keeps untouched fields stable when the caller only
+        # wants to change power or frequency.
         program_id = current_values.get("program_id", 0) if program_id is None else program_id
         power_w = current_values.get("power_w", 0) if power_w is None else power_w
         frequency_khz = current_values.get("frequency_khz", 0) if frequency_khz is None else frequency_khz
@@ -108,6 +120,7 @@ def compose_set_program_command(
     if not (0 <= detect_delay_int <= 99999999):
         raise ValueError("detect_delay_us must fit in DDDDDDDD (00000000-99999999)")
 
+    # Match the controller's exact fixed-width decimal payload layout.
     data = (
         f"{program_id_int:02d}"
         f"{power_int:04d}"

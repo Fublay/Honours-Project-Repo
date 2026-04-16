@@ -4,6 +4,9 @@
 It knows how to frame commands, read full lines, and wait for ACK/PID replies.
 """
 
+# Everything above this layer should be able to think in terms of commands and
+# parsed replies instead of raw serial bytes.
+
 import time
 import serial
 
@@ -12,6 +15,8 @@ from protocol.command_composer import compose_set_pid_command, compose_set_progr
 from protocol.reply_parser import parse_ack, parse_pid_reply, parse_program_reply
 
 
+# Keep serial edge cases in one class so the rest of the code can stay mostly
+# deterministic.
 class SerialLineIO:
     """
     Robust serial line reader/writer.
@@ -39,6 +44,8 @@ class SerialLineIO:
         self.default_command_id_hex2 = (default_command_id_hex2 or "00").strip().upper()
         self.checksum_fn = checksum_fn
 
+    # Most callers go through this rather than assembling protocol frames
+    # directly.
     def write_command(self, data: str, *, command_id_hex2: str | None = None) -> None:
         """Send one framed command to the controller."""
         cid = self.default_command_id_hex2 if command_id_hex2 is None else str(command_id_hex2).strip().upper()
@@ -46,6 +53,8 @@ class SerialLineIO:
         self.log_fn(f"TX -> {framed!r}")
         self.ser.write(framed)
 
+    # Maintain an internal byte buffer so fragmented serial reads still produce
+    # clean line-based messages.
     def read_line(self, timeout: float = 2.0, keep_terminator: bool = False) -> str:
         """Read one complete line from serial, preserving partial chunks safely."""
         t0 = time.time()
@@ -77,6 +86,7 @@ class SerialLineIO:
 
         raise TimeoutError("Timed out waiting for serial data")
 
+    # Wait through unrelated telemetry until an actual B6 reply arrives.
     def get_pid_values(self, timeout: float = 2.0) -> dict:
         """Send GET_PID and wait until a valid B6 reply is parsed."""
         cmd_bytes = compose_frame("B6", "", checksum_fn=self.checksum_fn)
@@ -101,6 +111,7 @@ class SerialLineIO:
             raise ValueError(f"Failed to parse GET_PID reply before timeout: {last_error}")
         raise TimeoutError("Timed out waiting for GET_PID reply")
 
+    # Same pattern as GET_PID, but for the packed program-config reply.
     def get_program_values(self, timeout: float = 2.0) -> dict:
         """Send GET_PROGRAM and wait until a valid 41 reply is parsed."""
         cmd_bytes = compose_frame("41", "00", checksum_fn=self.checksum_fn)
@@ -124,6 +135,8 @@ class SerialLineIO:
             raise ValueError(f"Failed to parse GET_PROGRAM reply before timeout: {last_error}")
         raise TimeoutError("Timed out waiting for GET_PROGRAM reply")
 
+    # Commands and telemetry can be interleaved on the wire, so ignore anything
+    # that is not an ACK while waiting for confirmation.
     def write_command_expect_ok_ack(
         self,
         data: str,
@@ -155,6 +168,8 @@ class SerialLineIO:
         accepted = ", ".join(f"*{c}" for c in accepted_codes)
         raise TimeoutError(f"Timed out waiting for accepted ACK ({accepted})")
 
+    # Preserve untouched PID fields by default so tuning writes do not
+    # accidentally zero unrelated controller parameters.
     def set_pid_values(
         self,
         pw_kp: float,
@@ -195,6 +210,7 @@ class SerialLineIO:
         ack = self.read_line(timeout=timeout)
         return ack
 
+    # Program writes follow the same read-modify-write idea as PID writes.
     def set_program_values(
         self,
         *,

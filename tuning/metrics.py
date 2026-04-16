@@ -7,16 +7,20 @@ import math
 import numpy as np
 
 
+# Small guard helpers keep the feature calculations from being cluttered with
+# repeated empty-list handling.
 def _safe_mean(values: list[float], default: float) -> float:
     finite = [float(v) for v in values if v is not None and np.isfinite(v)]
     return float(np.mean(finite)) if finite else float(default)
 
 
+# Same idea as `_safe_mean`, but for spread instead of centre.
 def _safe_std(values: list[float], default: float) -> float:
     finite = [float(v) for v in values if v is not None and np.isfinite(v)]
     return float(np.std(finite)) if finite else float(default)
 
 
+# Trim obvious outliers before averaging repeat-level features.
 def _robust_center(values: list[float], default: float) -> float:
     finite = sorted(float(v) for v in values if v is not None and np.isfinite(v))
     if not finite:
@@ -28,6 +32,7 @@ def _robust_center(values: list[float], default: float) -> float:
     return float(np.mean(finite))
 
 
+# Clean and align time/value arrays before any metric extraction.
 def _clean_trace(times: np.ndarray, readings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     times_arr = np.asarray(times, dtype=float).flatten()
     readings_arr = np.asarray(readings, dtype=float).flatten()
@@ -47,6 +52,7 @@ def _clean_trace(times: np.ndarray, readings: np.ndarray) -> tuple[np.ndarray, n
     return times_arr[order], readings_arr[order]
 
 
+# Approximate per-sample dwell times for uneven telemetry spacing.
 def _sample_widths(times: np.ndarray) -> np.ndarray:
     if times.size <= 1:
         return np.ones(int(max(1, times.size)), dtype=float)
@@ -59,6 +65,7 @@ def _sample_widths(times: np.ndarray) -> np.ndarray:
     return widths
 
 
+# Trapezoidal integral helper shared by several error-area metrics.
 def _integral(times: np.ndarray, values: np.ndarray) -> float:
     if times.size == 0 or values.size == 0:
         return 0.0
@@ -73,6 +80,8 @@ def _integral(times: np.ndarray, values: np.ndarray) -> float:
     return float(np.sum(area))
 
 
+# Return the first true index without forcing each caller to repeat the same
+# flatnonzero boilerplate.
 def _first_index(mask: np.ndarray) -> int | None:
     idx = np.flatnonzero(mask)
     if idx.size == 0:
@@ -80,6 +89,8 @@ def _first_index(mask: np.ndarray) -> int | None:
     return int(idx[0])
 
 
+# Rise time is measured from the first 10% crossing to the first 90% crossing
+# of the total move toward the target.
 def _compute_rise_time(times: np.ndarray, readings: np.ndarray, target: float) -> float | None:
     if times.size < 2 or readings.size < 2:
         return None
@@ -95,6 +106,8 @@ def _compute_rise_time(times: np.ndarray, readings: np.ndarray, target: float) -
     return float(times[i90] - times[i10])
 
 
+# Settling only counts once the signal enters the tolerance band and mostly
+# stays there for the rest of the trace.
 def _compute_settling_time(
     times: np.ndarray,
     abs_error: np.ndarray,
@@ -117,6 +130,7 @@ def _compute_settling_time(
     return None
 
 
+# Count sign flips while ignoring tiny oscillations inside a deadband.
 def _count_sign_changes(values: np.ndarray, deadband: float) -> int:
     signs = []
     for value in values:
@@ -128,6 +142,8 @@ def _count_sign_changes(values: np.ndarray, deadband: float) -> int:
     return int(sum(1 for prev, curr in zip(signs, signs[1:]) if prev != curr))
 
 
+# Keep a compact summary of the early part of the trace for any future
+# early-stop modelling or heuristics.
 def extract_early_trace_features(
     times: np.ndarray,
     readings: np.ndarray,
@@ -164,6 +180,7 @@ def extract_early_trace_features(
     }
 
 
+# Extract the repeat-level features that feed both scoring and diagnostics.
 def extract_repeat_features(
     times: np.ndarray,
     readings: np.ndarray,
@@ -209,6 +226,7 @@ def extract_repeat_features(
     if times_arr.size == 0:
         return empty_result
 
+    # Core tracking metrics.
     target = float(desired_output)
     base = max(abs(target), 1e-6)
     tolerance = max(base * float(tolerance_pct), 1e-6)
@@ -250,6 +268,8 @@ def extract_repeat_features(
     oscillation_count = _count_sign_changes(error, deadband=0.03 * base)
     trace_duration_s = float(max(times_arr[-1] - times_arr[0], 0.0)) if times_arr.size >= 2 else 0.0
 
+    # Hold metrics focus on the tail of the trace, where steady control matters
+    # more than startup behavior.
     hold_sample_count = min(
         readings_arr.size,
         max(int(math.ceil(readings_arr.size * float(hold_tail_fraction))), int(hold_min_samples)),
@@ -321,6 +341,7 @@ def extract_repeat_features(
     }
 
 
+# Collapse per-repeat features into one candidate-level feature vector.
 def aggregate_repeat_features(repeat_features: list[dict]) -> dict:
     """Aggregate repeat-level trace features into candidate-level features."""
     if not repeat_features:
@@ -376,6 +397,8 @@ def aggregate_repeat_features(repeat_features: list[dict]) -> dict:
     }
 
 
+# Combine repeat traces and repeat metadata into the aggregate metrics used by
+# scoring, logging, and bootstrap safety checks.
 def compute_trial_metrics(
     per_test_powers: list[np.ndarray],
     per_test_times: list[np.ndarray],
@@ -392,6 +415,8 @@ def compute_trial_metrics(
     per_test_scores_unweighted: list[float] = []
 
     for readings, times, meta in zip(per_test_powers, per_test_times, per_test_meta):
+        # Feature extraction works from the raw traces, while the metadata adds
+        # trial-runner decisions like invalidation and oscillation strikes.
         features = extract_repeat_features(
             times,
             readings,
@@ -446,6 +471,8 @@ def compute_trial_metrics(
     return metrics, repeat_features
 
 
+# Cheap repeat-level score used during a candidate run before the full weighted
+# controller score is computed.
 def score_single_repeat(readings: np.ndarray, meta: dict, desired_output: float) -> float:
     """Score one repeat quickly so unstable candidates can be stopped early."""
     if readings.size == 0:
@@ -473,6 +500,9 @@ def score_single_repeat(readings: np.ndarray, meta: dict, desired_output: float)
     )
 
 
+# Final scalar objective used by the tuner.
+# Lower is better, with extra penalties layered on top for unsafe or unstable
+# behaviour that should dominate small improvements elsewhere.
 def score_controller(
     metrics: dict,
     *,
@@ -498,6 +528,8 @@ def score_controller(
 ):
     """Combine control metrics into one scalar score (lower is better)."""
     hold_ratio = float(metrics.get("hold_time_in_tolerance_ratio", 0.0))
+    # Discount average tracking error when the controller demonstrably holds the
+    # target well in the tail.
     track_discount = 0.25 if hold_ratio >= 0.80 else (0.50 if hold_ratio >= 0.50 else 1.0)
     score = (
         w_start * float(metrics["start_error"])
@@ -518,6 +550,8 @@ def score_controller(
         - w_tolerance_time * float(metrics["time_in_tolerance_s"])
         + invalid_penalty * float(metrics["invalid_ratio"])
     )
+    # Hard behavioural penalties sit outside the weighted sum because they
+    # represent conditions the optimiser should avoid aggressively.
     if hold_ratio < 0.60:
         score += (0.60 - hold_ratio) * 300.0
     if float(metrics.get("hold_oscillation_count", 0.0)) >= 2.0:

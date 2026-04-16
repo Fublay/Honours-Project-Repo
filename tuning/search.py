@@ -23,11 +23,15 @@ except Exception:
     HAVE_SKLEARN = False
 
 
+# Keep the surrogate feature order explicit so fitting and prediction cannot
+# silently disagree about column order.
 SURROGATE_FEATURE_NAMES = ("kp", "ki", "kd", "desired_output", "frequency_khz")
 BayesSpaceDim = Any
 PidBounds = tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
 
 
+# Thin wrapper around a refit-on-update regressor.
+# The surrounding tuning code only needs "fit rows" and "predict candidates".
 class OnlineSurrogateModel:
     """Small refit-on-update surrogate wrapper for embedded-friendly tuning."""
 
@@ -39,6 +43,8 @@ class OnlineSurrogateModel:
         self.last_error = ""
         self.last_fit_count = 0
 
+    # Model selection stays inside the wrapper so callers never need to know
+    # which scikit-learn estimator is active.
     def _build_model(self):
         if not HAVE_SKLEARN or self.model_name == "none":
             raise RuntimeError("scikit-learn unavailable")
@@ -56,6 +62,8 @@ class OnlineSurrogateModel:
             random_state=self.random_state,
         )
 
+    # Refit from scratch on each update.
+    # The data sets here are small enough that the simpler lifecycle is worth it.
     def fit(self, rows: list[dict], *, min_samples: int) -> bool:
         usable = [row for row in rows if np.isfinite(float(row.get("score", math.inf)))]
         if len(usable) < int(min_samples):
@@ -82,6 +90,8 @@ class OnlineSurrogateModel:
             self.last_fit_count = len(usable)
             return False
 
+    # Return NaNs instead of raising so candidate selection can fall back
+    # gracefully when the surrogate becomes unusable.
     def predict(
         self,
         candidates: list[tuple[float, float, float]],
@@ -107,6 +117,8 @@ class OnlineSurrogateModel:
             return [math.nan for _ in candidates]
 
 
+# Training rows are stored as plain dicts so they are easy to log and write to
+# CSV alongside the rest of the run history.
 def build_surrogate_training_row(
     kp: float,
     ki: float,
@@ -126,6 +138,8 @@ def build_surrogate_training_row(
     }
 
 
+# Local optimisation later clamps search proposals to this box around the best
+# point seen so far.
 def build_local_refinement_bounds(
     best_pid: tuple[float, float, float],
     *,
@@ -150,6 +164,8 @@ def build_local_refinement_bounds(
     lower = np.clip(center - radii, 0.0, bounds_max)
     upper = np.clip(center + radii, 0.0, bounds_max)
 
+    # Guarantee a non-zero interval even if the requested radius collapses
+    # against a hard controller bound.
     minimum_widths = np.minimum(radii, np.asarray([kp_max, ki_max, kd_max], dtype=float))
     for idx in range(3):
         if upper[idx] > lower[idx]:
@@ -172,6 +188,7 @@ def build_local_refinement_bounds(
     )
 
 
+# Shared clamp helper so every proposal path honours the same bounds.
 def clamp_pid_to_bounds(pid: tuple[float, float, float], bounds: PidBounds | None) -> tuple[float, float, float]:
     if bounds is None:
         return tuple(float(v) for v in pid)
@@ -182,6 +199,8 @@ def clamp_pid_to_bounds(pid: tuple[float, float, float], bounds: PidBounds | Non
     return float(clipped[0]), float(clipped[1]), float(clipped[2])
 
 
+# Turn broader exploration steps into smaller local moves during the refinement
+# phases.
 def compute_refinement_step_sizes(
     *,
     step_kp: float,
@@ -213,6 +232,7 @@ def compute_refinement_step_sizes(
     return float(result[0]), float(result[1]), float(result[2])
 
 
+# Keep only observations that sit inside the currently active search box.
 def filter_points_to_bounds(
     points: list[tuple[float, float, float]],
     bounds: PidBounds | None,
@@ -229,6 +249,9 @@ def filter_points_to_bounds(
     return filtered
 
 
+# Build a small candidate pool around the current centre, score it with the
+# surrogate, and occasionally force an exploratory pick to avoid overfitting to
+# the model's current belief.
 def propose_surrogate_candidate(
     surrogate: OnlineSurrogateModel,
     *,
@@ -256,6 +279,7 @@ def propose_surrogate_candidate(
         (0.0, float(kd_max)),
     )
     active_bounds = local_bounds or global_bounds
+    # Fall back to the middle of the legal space if there is no current best.
     center = clamp_pid_to_bounds(
         best_pid or (0.5 * kp_max, 0.5 * ki_max, 0.5 * kd_max),
         active_bounds,
@@ -274,9 +298,12 @@ def propose_surrogate_candidate(
         candidates.append(center)
 
     if candidate_safe_points:
+        # Seed the pool with a few already-safe points so the model can choose
+        # between exploitation and local revisits.
         for point in candidate_safe_points[-min(6, len(candidate_safe_points)) :]:
             candidates.append(tuple(float(v) for v in point))
 
+    # Add jittered local proposals around the best point or known safe points.
     for _ in range(max(8, int(pool_size))):
         if best_pid is not None and rng.random() < 0.7:
             base = np.asarray(center, dtype=float)
@@ -299,6 +326,8 @@ def propose_surrogate_candidate(
     seen = set()
     observed_rounded = {tuple(round(v, 6) for v in point) for point in observed_points}
     for candidate in candidates:
+        # Skip exact repeats so each expensive hardware trial teaches us
+        # something new.
         rounded = tuple(round(v, 6) for v in candidate)
         if rounded in seen or rounded in observed_rounded:
             continue
@@ -315,12 +344,15 @@ def propose_surrogate_candidate(
     )
     ranked = sorted(zip(deduped, predictions), key=lambda item: item[1] if np.isfinite(item[1]) else float("inf"))
     if rng.random() < float(explore_prob) and len(ranked) > 1:
+        # Exploration can choose from both the top and tail of the ranking.
         choice = rng.choice(ranked[: min(4, len(ranked))] + ranked[-min(3, len(ranked)) :])
         return choice[0], float(choice[1]), "surrogate_explore"
     best_candidate, best_pred = ranked[0]
     return best_candidate, float(best_pred), "surrogate"
 
 
+# Coordinate search moves one PID term at a time and flips direction when a
+# proposed step would hit a bound immediately.
 def propose_coordinate_candidate(
     base_pid: tuple[float, float, float],
     axis_index: int,
@@ -359,6 +391,8 @@ def propose_coordinate_candidate(
     return (values[0], values[1], values[2]), used_axis, direction, float(actual_delta)
 
 
+# Build the Bayesian optimiser's legal search box.
+# When refinement bounds are active, stay tightly local around the best point.
 def build_bayes_search_space(
     safe_pids: list[tuple[float, float, float]],
     *,
@@ -396,6 +430,8 @@ def build_bayes_search_space(
         ]
 
     if not safe_pids:
+        # Before bootstrap has identified a safe region, the whole controller
+        # range is technically available.
         return [
             Real(0.0, kp_max, name="kp"),
             Real(0.0, ki_max, name="ki"),
@@ -409,6 +445,7 @@ def build_bayes_search_space(
     lower = np.clip(mins - pads, 0.0, bounds_max)
     upper = np.clip(maxs + pads, 0.0, bounds_max)
 
+    # Avoid zero-width dimensions after clipping and padding.
     for idx in range(3):
         if upper[idx] <= lower[idx]:
             upper[idx] = min(bounds_max[idx], lower[idx] + max(pads[idx], 1e-3))
@@ -421,6 +458,8 @@ def build_bayes_search_space(
     ]
 
 
+# skopt can only warm-start from points that already lie inside the active
+# search box.
 def filter_seed_points_for_space(
     points: list[tuple[float, float, float]],
     scores: list[float],

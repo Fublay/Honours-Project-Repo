@@ -5,11 +5,15 @@ firmware revisions (legacy DATA, hex B0 debug, decimal B0 debug, and generic
 key/value telemetry).
 """
 
+# Real hardware emits more than one telemetry shape, so parsing is centralized
+# here instead of being duplicated across collection and scoring code.
+
 import re
 
 from protocol.frame_codec import is_framed_command
 
 
+# Legacy text telemetry line.
 DATA_RE = re.compile(
     r"t=([0-9.]+)\s+"
     r"y=([0-9.eE+-]+)"
@@ -17,12 +21,15 @@ DATA_RE = re.compile(
     r"u=([0-9.eE+-]+)\s+"
     r"status=([A-Z]+)"
 )
+# Loose key/value fallback for debug output that names fields explicitly.
 KV_RE = re.compile(r"([A-Za-z_]+)=([0-9.eE+-]+)")
+# Hex-encoded B0 packet emitted by one family of firmware revisions.
 DEBUG_B0_RE = re.compile(
     r"^\$B0"
     r"([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8})"
     r"([0-9A-Fa-f]{2})$"
 )
+# Decimal B0 variant seen on other firmware builds.
 DEBUG_B0_DEC_RE = re.compile(
     r"^\$B0\s*"
     r"([0-9]+(?:\.[0-9]+)?):\s*"
@@ -33,6 +40,7 @@ DEBUG_B0_DEC_RE = re.compile(
 )
 
 
+# PID replies are strict because field order and spacing matter later on.
 def parse_pid_reply(packet: str) -> dict:
     """
     Parse a GET_PID reply packet.
@@ -68,9 +76,11 @@ def parse_pid_reply(packet: str) -> dict:
 
     try:
         return {
+            # Power-window PID fields come first.
             "pw_kp": float(fields[0]),
             "pw_ki": float(fields[1]),
             "pw_kd": float(fields[2]),
+            # Pulse-program PID and timing fields follow.
             "pp_kp": float(fields[3]),
             "pp_ki": float(fields[4]),
             "pp_kd": float(fields[5]),
@@ -81,6 +91,8 @@ def parse_pid_reply(packet: str) -> dict:
         raise ValueError(f"Failed to parse PID values: {e}")
 
 
+# Program replies use a packed decimal payload rather than space-separated
+# values.
 def parse_program_reply(packet: str) -> dict:
     """
     Parse a GET_PROGRAM reply packet.
@@ -119,6 +131,7 @@ def parse_program_reply(packet: str) -> dict:
         raise ValueError(f"Failed to parse GET_PROGRAM reply: {e}")
 
 
+# ACK parsing stays intentionally tiny because the wire format is tiny.
 def parse_ack(line: str) -> tuple[bool, str]:
     """
     Parse controller ack like '*00'.
@@ -132,6 +145,8 @@ def parse_ack(line: str) -> tuple[bool, str]:
     return code == "00", code
 
 
+# Return `None` for anything that is not a valid telemetry sample.
+# The collector relies on that to ignore ACKs and unrelated controller chatter.
 def parse_telemetry_line(line: str) -> dict | None:
     """
     Parse one telemetry line from any supported format:
@@ -185,6 +200,7 @@ def parse_telemetry_line(line: str) -> dict | None:
 
     match = DATA_RE.search(s) if s.startswith("DATA") else None
     if match is not None:
+        # The legacy DATA format already names the process and control fields.
         t, y, _sp, u, status = match.groups()
         return {
             "t": float(t),
@@ -196,6 +212,8 @@ def parse_telemetry_line(line: str) -> dict | None:
     # Generic key/value telemetry fallback.
     kv = {k.strip().lower(): float(v) for k, v in KV_RE.findall(s)}
 
+    # Firmware aliases drift between builds, so treat several spellings as
+    # equivalent rather than requiring one exact key.
     def first(keys: tuple[str, ...]) -> float | None:
         for key in keys:
             if key in kv:
@@ -211,6 +229,7 @@ def parse_telemetry_line(line: str) -> dict | None:
     if None in (initial_power, current_power, pulse_period, pulse_width):
         return None
 
+    # Emit the fallback sample in the same shape used by the dedicated B0 paths.
     return {
         "t": t_val,
         "initial_power": float(initial_power),

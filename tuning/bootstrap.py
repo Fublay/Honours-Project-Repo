@@ -9,9 +9,14 @@ import numpy as np
 from tuning.search import propose_coordinate_candidate
 
 
+# Keep axis ordering in one shared tuple so diagnostics and search code stay in
+# sync whenever they refer to Kp/Ki/Kd by index.
 AXIS_NAMES = ("kp", "ki", "kd")
 
 
+# Bootstrap probes often revisit the same point.
+# Collapse duplicates before counting spread or density so retries do not make a
+# region look better explored than it really is.
 def _dedupe_points(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
     """Collapse repeated probes of the same PID tuple into a single point."""
     unique: list[tuple[float, float, float]] = []
@@ -25,6 +30,8 @@ def _dedupe_points(points: list[tuple[float, float, float]]) -> list[tuple[float
     return unique
 
 
+# "Safe" means the candidate completed cleanly enough to be used when deciding
+# whether optimisation is allowed to begin.
 def candidate_is_safe(
     metrics: dict,
     *,
@@ -43,6 +50,8 @@ def candidate_is_safe(
     return True
 
 
+# "Good" is stricter than "safe": still stable, but also competitive enough to
+# treat as a promising point near the baseline.
 def candidate_is_good(
     metrics: dict,
     score: float,
@@ -68,6 +77,8 @@ def candidate_is_good(
     return float(score) <= (float(baseline_score) * float(max_score_factor))
 
 
+# Build per-axis diagnostics so the GUI can show whether bootstrap has really
+# explored a usable local neighbourhood yet.
 def compute_bootstrap_axis_status(
     safe_points: list[tuple[float, float, float]],
     *,
@@ -80,6 +91,8 @@ def compute_bootstrap_axis_status(
     required_spans = (float(min_span_kp), float(min_span_ki), float(min_span_kd))
     unique_safe_points = _dedupe_points(safe_points)
     if not unique_safe_points:
+        # Keep the empty-state payload fully shaped so the UI does not have to
+        # special-case missing keys.
         return [
             {
                 "axis_index": idx,
@@ -103,6 +116,8 @@ def compute_bootstrap_axis_status(
     safe_arr = np.asarray(unique_safe_points, dtype=float)
     statuses: list[dict] = []
     for idx, required_span in enumerate(required_spans):
+        # Coverage is tracked both by distinct tested values and by total span
+        # because either one alone can be misleading.
         axis_values = np.round(safe_arr[:, idx], 6)
         distinct_safe_values = int(len(np.unique(axis_values)))
         safe_span = float(np.max(safe_arr[:, idx]) - np.min(safe_arr[:, idx])) if safe_arr.size else 0.0
@@ -138,6 +153,8 @@ def compute_bootstrap_axis_status(
     return statuses
 
 
+# Scale the "local neighbourhood" around the best point from both the current
+# step sizes and the minimum spread targets.
 def _local_radius(
     *,
     step_kp: float,
@@ -154,6 +171,7 @@ def _local_radius(
     )
 
 
+# Keep only points that lie inside the current local neighbourhood box.
 def _nearby_points(
     points: list[tuple[float, float, float]],
     center: tuple[float, float, float],
@@ -169,6 +187,8 @@ def _nearby_points(
     return [tuple(float(v) for v in row) for row in pts[mask]]
 
 
+# Count how much local movement each axis has actually seen near the current
+# best point.
 def _axis_variation(points: list[tuple[float, float, float]], radii: tuple[float, float, float]) -> tuple[tuple[int, int, int], tuple[float, float, float], tuple[int, int, int]]:
     if not points:
         return (0, 0, 0), (0.0, 0.0, 0.0), (0, 0, 0)
@@ -179,6 +199,8 @@ def _axis_variation(points: list[tuple[float, float, float]], radii: tuple[float
     return unique_counts, spans, varied_axes
 
 
+# Decide whether bootstrap has learned enough about the stable region around the
+# current best PID to hand control over to the optimisation phase.
 def assess_local_safe_region(
     safe_points: list[tuple[float, float, float]],
     good_points: list[tuple[float, float, float]],
@@ -207,6 +229,7 @@ def assess_local_safe_region(
         min_span_kd=min_span_kd,
     )
     if best_pid is None:
+        # Without a best point there is no local region to judge yet.
         return {
             "ready": False,
             "reason": "waiting for a best candidate",
@@ -253,6 +276,8 @@ def assess_local_safe_region(
 
     local_safe_target = max(3, min(int(min_safe_candidates), 4))
     if len(unique_safe_points) < int(min_safe_candidates):
+        # Global safe count is still the first gate before local structure
+        # matters.
         reason = f"only {len(unique_safe_points)} safe candidates collected so far"
         ready = False
     elif len(local_safe) < local_safe_target:
@@ -280,6 +305,8 @@ def assess_local_safe_region(
 
     weakest_axis = None
     if not ready:
+        # Surface the weakest axis so the UI and logs can explain what is still
+        # missing from the local region.
         weakness = [
             (
                 idx,
@@ -309,6 +336,8 @@ def assess_local_safe_region(
     }
 
 
+# Bootstrap only finishes once both the hard minimum trial count and the local
+# safe-region checks agree that the search has enough footing.
 def assess_bootstrap_progress(
     *,
     bootstrap_trials_done: int,
@@ -343,6 +372,8 @@ def assess_bootstrap_progress(
     }
 
 
+# Pick the next bootstrap axis by favouring whichever axis is least explored
+# near the current base point, while still respecting controller bounds.
 def choose_bootstrap_axis(
     base_pid: tuple[float, float, float],
     *,
@@ -382,6 +413,8 @@ def choose_bootstrap_axis(
     ranked: list[tuple[tuple[float, ...], int]] = []
     for status in axis_statuses:
         axis_idx = int(status["axis_index"])
+        # Reuse the coordinate-step proposal logic here so axis selection only
+        # considers moves that are actually legal under the current bounds.
         _, _, _, actual_delta = propose_coordinate_candidate(
             base_pid,
             axis_index=axis_idx,
@@ -414,5 +447,7 @@ def choose_bootstrap_axis(
     if not ranked:
         return int(preferred_axis_index) % 3, axis_statuses
 
+    # Lowest tuple wins: least local span, least local uniqueness, then least
+    # global coverage.
     ranked.sort(key=lambda item: item[0])
     return int(ranked[0][1]), axis_statuses

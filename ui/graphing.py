@@ -7,6 +7,8 @@ import time
 import numpy as np
 
 
+# This file covers both the live Tk monitor used during tuning and the offline
+# matplotlib views for saved CSV traces.
 class RuntimeMonitor:
     """Simple live Tk monitor for current power and active PID values."""
 
@@ -25,6 +27,8 @@ class RuntimeMonitor:
         "Overshoot: --   Hold: --"
     )
 
+    # Build the monitor window once and then update StringVars from the tuning
+    # loop.
     def __init__(self, root, *, desired_output: float):
         import tkinter as tk
 
@@ -37,6 +41,8 @@ class RuntimeMonitor:
         self._last_redraw = 0.0
         self._candidate_reason_base = ""
 
+        # Reuse the supplied root by clearing any previous launcher widgets out
+        # of it first.
         for child in self.root.winfo_children():
             child.destroy()
 
@@ -47,6 +53,7 @@ class RuntimeMonitor:
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
 
+        # StringVars keep UI updates cheap and avoid rebuilding widgets.
         self.status_var = tk.StringVar(value="Preparing tuner...")
         self.phase_var = tk.StringVar(value="BOOTSTRAP")
         self.candidate_source_var = tk.StringVar(value="Candidate source: bootstrap")
@@ -66,6 +73,7 @@ class RuntimeMonitor:
 
         tk.Label(frame, text="Live Power Output", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
 
+        # Top row: run summary, bootstrap diagnostics, and best candidate.
         summary_row = tk.Frame(frame)
         summary_row.pack(fill="x", pady=(6, 8))
         summary_row.grid_columnconfigure(0, weight=3)
@@ -94,6 +102,7 @@ class RuntimeMonitor:
         right_panel.grid(row=0, column=2, sticky="nsew")
         tk.Label(right_panel, textvariable=self.best_candidate_var, justify="left", anchor="w").pack(anchor="w")
 
+        # Middle text rows carry the changing run status.
         tk.Label(frame, textvariable=self.progress_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
         tk.Label(frame, textvariable=self.warmup_counter_var, font=("TkDefaultFont", 10)).pack(anchor="w", pady=(2, 0))
         tk.Label(frame, textvariable=self.warmup_change_var, justify="left", anchor="w").pack(anchor="w", pady=(2, 0))
@@ -105,6 +114,7 @@ class RuntimeMonitor:
         self.canvas = tk.Canvas(frame, width=920, height=420, bg="white", highlightthickness=1)
         self.canvas.pack(fill="both", expand=True)
 
+        # Footer keeps the active controller PID visible during the run.
         footer = tk.Frame(frame, pady=8)
         footer.pack(fill="x")
         tk.Label(footer, textvariable=self.pid_var, anchor="w", justify="left").pack(side="left")
@@ -115,12 +125,16 @@ class RuntimeMonitor:
         self.process_events()
         self._draw_plot()
 
+    # Closing the monitor mid-run would leave the tuning flow without a window,
+    # so redirect the user to the main Quit action instead.
     def _on_close_requested(self):
         if self.closed:
             return
         self.close_hint_var.set("Use the main menu Quit button to exit the application.")
         self.process_events()
 
+    # Tk needs regular event pumping because the main tuning loop is not itself
+    # a Tk event loop.
     def process_events(self):
         if self.closed:
             return
@@ -130,10 +144,13 @@ class RuntimeMonitor:
         except self.tk.TclError:
             self.closed = True
 
+    # Target changes should redraw immediately so the reference line stays
+    # current.
     def set_target(self, desired_output: float):
         self.desired_output = float(desired_output)
         self._draw_plot(force=True)
 
+    # The simple setters below feed status text into the live monitor.
     def set_status(self, message: str):
         if self.closed:
             return
@@ -169,10 +186,14 @@ class RuntimeMonitor:
         )
         self.process_events()
 
+    # Render bootstrap spread diagnostics as compact text rather than building a
+    # second chart.
     def set_axis_coverage(self, axis_statuses: list[dict]):
         if self.closed:
             return
 
+        # Tiny text bar to show bootstrap coverage progress without adding more
+        # chart widgets to the monitor.
         def bar(ratio: float) -> str:
             filled = max(0, min(10, int(round(max(0.0, min(1.0, float(ratio))) * 10.0))))
             return "[" + ("#" * filled) + ("-" * (10 - filled)) + "]"
@@ -182,6 +203,8 @@ class RuntimeMonitor:
         else:
             lines = ["Local region diagnostics:"]
             for status in axis_statuses:
+                # Each line reports both distinct tested values and total spread
+                # on that axis.
                 axis_name = str(status.get("axis_name", "?")).capitalize()
                 distinct = int(status.get("distinct_safe_values", 0))
                 target = int(status.get("required_distinct_values", 0))
@@ -199,6 +222,8 @@ class RuntimeMonitor:
         self.axis_coverage_var.set(message)
         self.process_events()
 
+    # Best-candidate display is separate from the currently running controller
+    # PID shown in the footer.
     def set_best_candidate(
         self,
         *,
@@ -225,11 +250,15 @@ class RuntimeMonitor:
         self.best_candidate_var.set(message)
         self.process_events()
 
+    # Progress text gets prefixed with the candidate-selection reason while a
+    # trial is in flight.
     def set_progress(self, message: str):
         if self.closed:
             return
         text = str(message)
         if self._candidate_reason_base:
+            # Keep the selected-candidate reason visible even as the progress
+            # suffix changes from configuring -> waiting -> active -> stopped.
             if text.startswith(self._candidate_reason_base):
                 combined = text
             elif text:
@@ -241,6 +270,8 @@ class RuntimeMonitor:
             self.progress_var.set(text)
         self.process_events()
 
+    # Candidate info now owns the "why this PID was chosen" text instead of the
+    # footer PID line.
     def set_candidate_info(self, kp: float, ki: float, kd: float, reason: str):
         """
         Display the PID currently being tested and why it was selected.
@@ -253,6 +284,8 @@ class RuntimeMonitor:
         self.progress_var.set(self._candidate_reason_base)
         self.process_events()
 
+    # Bootstrap summary setters feed the text blocks down the left side of the
+    # monitor.
     def set_readiness(self, message: str):
         if self.closed:
             return
@@ -277,6 +310,8 @@ class RuntimeMonitor:
         self.prev_warmup_result_var.set(str(message))
         self.process_events()
 
+    # Show the actual controller PID currently under test, with an optional
+    # comparison against the current best point.
     def set_pid_values(
         self,
         kp: float,
@@ -287,6 +322,8 @@ class RuntimeMonitor:
     ):
         if self.closed:
             return
+        # This line is meant to answer "what PID is actually on the controller
+        # right now?" rather than "what candidate was proposed?".
         message = f"Controller PID under test: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}"
         if best_pid is not None:
             delta_kp = float(kp) - float(best_pid[0])
@@ -299,6 +336,8 @@ class RuntimeMonitor:
         self.pid_var.set(message)
         self.process_events()
 
+    # Starting a repeat resets the live trace while keeping the surrounding run
+    # summary intact.
     def begin_test(
         self,
         *,
@@ -324,9 +363,13 @@ class RuntimeMonitor:
         self._draw_plot(force=True)
         self.process_events()
 
+    # Each telemetry sample updates the displayed power and extends the live
+    # trace on the canvas.
     def append_sample(self, time_s: float, power: float, *, status: str | None = None):
         if self.closed:
             return
+        # Start every live trace from an explicit origin so the canvas never
+        # looks empty when the first point arrives.
         display_time = float(time_s) + self.DISPLAY_TIME_OFFSET_S
         if not self._times:
             self._times.append(0.0)
@@ -335,14 +378,17 @@ class RuntimeMonitor:
         self._powers.append(float(power))
         self.power_var.set(f"Current power: {float(power):.4f}")
         if status:
+            # Surface the controller's last reported status string directly.
             self.status_var.set(str(status))
 
         now = time.monotonic()
+        # Throttle redraws so serial sampling does not overwhelm Tk.
         if (now - self._last_redraw) >= 0.08:
             self._draw_plot()
             self._last_redraw = now
             self.process_events()
 
+    # Freeze the plot with a final status message once the run completes.
     def mark_complete(self, message: str):
         if self.closed:
             return
@@ -350,17 +396,22 @@ class RuntimeMonitor:
         self._draw_plot(force=True)
         self.process_events()
 
+    # Used when the graph window should stay open independently of the tuning
+    # loop.
     def wait_until_closed(self):
         while not self.closed:
             self.process_events()
             time.sleep(0.05)
 
+    # Lightweight live plot drawn directly with Tk canvas primitives so the
+    # runtime monitor does not depend on matplotlib.
     def _draw_plot(self, force: bool = False):
         if self.closed:
             return
         canvas = self.canvas
         canvas.delete("plot")
 
+        # Compute a simple plotting box with margins for labels.
         width = max(int(canvas.winfo_width()), 100)
         height = max(int(canvas.winfo_height()), 100)
         left = 56
@@ -380,9 +431,12 @@ class RuntimeMonitor:
             if t_max <= t_min:
                 t_max = t_min + 1.0
 
+            # Keep the live chart anchored at zero power and leave headroom
+            # above the target so overshoot remains visible.
             y_min = 0.0
             y_max = max(self.desired_output * 1.4, 1.0)
 
+            # Small coordinate transforms from data space into canvas pixels.
             def x_px(value: float) -> float:
                 return left + ((value - t_min) / (t_max - t_min)) * plot_w
 
@@ -390,6 +444,7 @@ class RuntimeMonitor:
                 return bottom - ((value - y_min) / (y_max - y_min)) * plot_h
 
             target_y = y_px(self.desired_output)
+            # Dashed target line gives the operator a constant visual reference.
             canvas.create_line(left, target_y, right, target_y, fill="#cc5533", dash=(5, 3), tags="plot")
             canvas.create_text(right, target_y - 8, text=f"Target {self.desired_output:.2f}", anchor="e", tags="plot")
 
@@ -397,12 +452,15 @@ class RuntimeMonitor:
             for t_val, power_val in zip(self._times, self._powers):
                 points.extend((x_px(t_val), y_px(power_val)))
             if len(points) >= 4:
+                # Smooth the live trace slightly so the plot stays legible even
+                # when sample times are dense.
                 canvas.create_line(*points, fill="#1f77b4", width=2, smooth=True, splinesteps=24, tags="plot")
 
             canvas.create_text(right, bottom + 18, text=f"{t_max:.2f} s", anchor="e", tags="plot")
             canvas.create_text(left - 8, bottom, text=f"{y_min:.1f}", anchor="e", tags="plot")
             canvas.create_text(left - 8, top, text=f"{y_max:.1f}", anchor="e", tags="plot")
         else:
+            # Empty-state message while waiting for the first telemetry packet.
             canvas.create_text(
                 (left + right) / 2,
                 (top + bottom) / 2,
@@ -414,6 +472,7 @@ class RuntimeMonitor:
                 canvas.create_text(right, bottom + 18, text="0 s", anchor="e", tags="plot")
 
 
+# Startup launcher dialog shown before the serial run begins.
 def prompt_launch_gui(
     default_goal: float,
     default_trials: int,
@@ -428,6 +487,7 @@ def prompt_launch_gui(
     except Exception:
         return None
 
+    # Mutable container shared with the nested button callbacks.
     result = {
         "action": None,
         "goal": float(default_goal),
@@ -437,6 +497,7 @@ def prompt_launch_gui(
         "root": root,
     }
 
+    # Reuse an existing root when the app cycles between launcher and monitor.
     if root is None:
         try:
             root = tk.Tk()
@@ -451,6 +512,8 @@ def prompt_launch_gui(
     for child in root.winfo_children():
         child.destroy()
 
+    # Keep the launcher compact and form-like; the live monitor is the richer
+    # window.
     root.title("PID Tuner")
     root.resizable(False, False)
 
@@ -459,6 +522,7 @@ def prompt_launch_gui(
     root.grid_columnconfigure(0, weight=1)
     root.grid_rowconfigure(0, weight=1)
 
+    # Simple vertical form: goal, frequency, trial count, duration.
     tk.Label(frame, text="Goal Power Output").grid(row=0, column=0, sticky="w")
     goal_var = tk.StringVar(value=f"{float(default_goal):.4f}")
     goal_entry = tk.Entry(frame, textvariable=goal_var, width=16)
@@ -482,6 +546,7 @@ def prompt_launch_gui(
 
     
 
+    # Validate all user-entered fields before leaving the dialog.
     def parse_fields() -> bool:
         try:
             goal = float(goal_var.get().strip())
@@ -515,6 +580,7 @@ def prompt_launch_gui(
         result["frequency_khz"] = frequency_khz
         return True
 
+    # Button handlers update `result` and then hand control back to the caller.
     def on_start():
         if not parse_fields():
             return
@@ -537,6 +603,8 @@ def prompt_launch_gui(
         root.quit()
 
     def on_window_close():
+        # Deliberately do not destroy the root here; the app wants an explicit
+        # Quit action from the user.
         status_var.set("Use the Quit button to close the application.")
 
     btn_row = tk.Frame(frame)
@@ -555,6 +623,7 @@ def prompt_launch_gui(
     return result
 
 
+# Load the saved power CSV into one grouped time series per (trial, test).
 def load_power_series(csv_path: str):
     """Load saved power CSV rows and group them by (trial_index, test_index)."""
     series_map = {}
@@ -571,12 +640,14 @@ def load_power_series(csv_path: str):
             except (ValueError, KeyError):
                 continue
             key = (trial, test)
+            # Group repeated CSV rows back into one time series per test.
             bucket = series_map.setdefault(key, {"time_s": [], "power": [], "goal": goal, "invalid": False})
             bucket["time_s"].append(t_s)
             bucket["power"].append(power)
             bucket["goal"] = goal
             bucket["invalid"] = bucket["invalid"] or invalid
 
+    # Convert list buckets to numpy arrays once after grouping.
     final = {}
     for key, payload in series_map.items():
         final[key] = {
@@ -588,6 +659,7 @@ def load_power_series(csv_path: str):
     return final
 
 
+# Cheap trace-quality metric used by the offline graph helpers.
 def compute_series_mae(payload: dict) -> float:
     """Compute mean absolute error to the goal for one saved test series."""
     power = np.asarray(payload["power"], dtype=float)
@@ -597,6 +669,8 @@ def compute_series_mae(payload: dict) -> float:
     return float(np.mean(np.abs(power - goal)))
 
 
+# Prefer valid tests, but fall back to invalid ones if the CSV only contains
+# invalid traces.
 def find_best_single_test(series: dict):
     """Return the best individual test key by MAE, preferring non-invalid tests."""
     best_key = None
@@ -619,10 +693,13 @@ def find_best_single_test(series: dict):
     return best_key
 
 
+# Build one representative averaged trace per trial so the offline plots stay
+# readable.
 def build_trial_average_series(series: dict):
     """Build one averaged trace per trial, dropping the worst valid test as an outlier when possible."""
     tests_by_trial = {}
     for key, payload in series.items():
+        # Group all repeats that belong to the same trial candidate.
         tests_by_trial.setdefault(key[0], []).append((key, payload))
 
     averages = {}
@@ -635,6 +712,8 @@ def build_trial_average_series(series: dict):
         candidates = valid or non_empty
         removed_key = None
         if len(candidates) >= 3:
+            # Drop the worst candidate as a light outlier filter when enough
+            # repeats are available.
             removed_key, _ = max(candidates, key=lambda item: compute_series_mae(item[1]))
             candidates = [item for item in candidates if item[0] != removed_key]
 
@@ -642,6 +721,7 @@ def build_trial_average_series(series: dict):
             candidates = valid or non_empty
 
         best_test_key, best_test_payload = min(candidates, key=lambda item: compute_series_mae(item[1]))
+        # Average only over the common overlapping prefix so all traces line up.
         min_len = min(
             min(len(np.asarray(payload["time_s"], dtype=float)), len(np.asarray(payload["power"], dtype=float)))
             for _, payload in candidates
@@ -663,6 +743,8 @@ def build_trial_average_series(series: dict):
     return averages
 
 
+# History CSV is written one row per trial, so the best row number matches the
+# 1-based trial index used elsewhere.
 def load_best_trial_index(history_csv_path: str):
     """Return the 1-based trial index with the lowest score, if available."""
     best_trial = None
@@ -680,6 +762,7 @@ def load_best_trial_index(history_csv_path: str):
     return best_trial
 
 
+# Power and history CSVs are written as sibling files with predictable names.
 def infer_history_csv_path(power_csv_path: str) -> str:
     """Infer the sibling tuning history CSV path from the power readings CSV path."""
     power_path = Path(power_csv_path)
@@ -688,6 +771,7 @@ def infer_history_csv_path(power_csv_path: str) -> str:
     return str(power_path.with_name(f"{power_path.stem}_history.csv"))
 
 
+# Plot one or two explicitly selected saved tests.
 def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tuple[int, int] | None = None):
     """Plot one or two selected test traces from CSV data."""
     import matplotlib.pyplot as plt
@@ -700,11 +784,13 @@ def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tupl
 
     fig, ax = plt.subplots(figsize=(10, 5))
     first = series[first_key]
+    # Plot the first selected trace and its goal line.
     ax.plot(first["time_s"], first["power"], label=f"Trial {first_key[0]} Test {first_key[1]}")
     ax.axhline(first["goal"], linestyle="--", linewidth=1.2, alpha=0.8, label=f"Goal {first['goal']:.2f}")
 
     if second_key is not None:
         second = series[second_key]
+        # Optional comparison trace.
         ax.plot(second["time_s"], second["power"], label=f"Trial {second_key[0]} Test {second_key[1]}")
         if abs(second["goal"] - first["goal"]) > 1e-9:
             ax.axhline(
@@ -725,6 +811,9 @@ def plot_power_tests(csv_path: str, first_key: tuple[int, int], second_key: tupl
     plt.show()
 
 
+# Main offline graph workflow used by the launcher.
+# It compares the initial trial against the best trial instead of drawing every
+# saved repeat at once.
 def plot_power_tests_interactive(csv_path: str):
     """Open graph window showing only the initial and best trial traces."""
     import matplotlib.pyplot as plt
@@ -744,12 +833,15 @@ def plot_power_tests_interactive(csv_path: str):
         raise RuntimeError(f"No valid trial averages found in {csv_path}")
 
     initial_trial_index = min(trial_averages.keys())
+    # Compare the very first averaged trial against the best averaged trial.
     selected_trials = [initial_trial_index]
     if best_trial_index is not None and best_trial_index in trial_averages and best_trial_index != initial_trial_index:
         selected_trials.append(best_trial_index)
 
     fig, ax_plot = plt.subplots(figsize=(12, 6))
 
+    # Avoid duplicate goal lines when both selected trials share the same
+    # target.
     goals_plotted = set()
     for trial in selected_trials:
         payload = trial_averages[trial]
@@ -774,6 +866,7 @@ def plot_power_tests_interactive(csv_path: str):
             goals_plotted.add(goal_val)
 
     def apply_default_view():
+        # Keep the y-axis rooted at zero for power plots.
         ax_plot.relim()
         ax_plot.autoscale_view(scalex=True, scaley=True)
         y_top = ax_plot.get_ylim()[1]
@@ -794,6 +887,8 @@ def plot_power_tests_interactive(csv_path: str):
     plt.show()
 
 
+# Surface missing-file and missing-dependency errors as readable runtime
+# messages.
 def run_graph_tool(csv_path: str, prefer_gui: bool = True):
     """Run graph view workflow and surface readable errors for missing dependencies."""
     try:
@@ -804,6 +899,8 @@ def run_graph_tool(csv_path: str, prefer_gui: bool = True):
     if not series:
         raise RuntimeError(f"No valid readings found in {csv_path}")
 
+    # `prefer_gui` is kept in the signature for future expansion, but the
+    # current workflow always opens the interactive matplotlib view.
     _ = series
     _ = prefer_gui
     try:
