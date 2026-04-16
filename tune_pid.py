@@ -493,7 +493,7 @@ def main() -> None:
     ap.add_argument("--w-steady", type=float, default=8.0, help="Weight: steady-state error")
     ap.add_argument("--w-iae", type=float, default=0.03, help="Weight: integral absolute error")
     ap.add_argument("--w-ise", type=float, default=0.005, help="Weight: integral squared error")
-    ap.add_argument("--w-tolerance-time", type=float, default=2.5, help="Reward weight for time in tolerance band")
+    ap.add_argument("--w-tolerance-ratio", type=float, default=2.0, help="Reward weight for fraction of trace spent in tolerance band")
     ap.add_argument("--w-post-var", type=float, default=6.0, help="Weight: post-settle variance")
     ap.add_argument("--w-hold", type=float, default=5.0, help="Weight: explicit final hold-quality penalty")
     ap.add_argument("--invalid-penalty", type=float, default=800.0, help="Penalty multiplier for invalid tests")
@@ -1215,7 +1215,7 @@ def main() -> None:
                     w_steady=args.w_steady,
                     w_iae=args.w_iae,
                     w_ise=args.w_ise,
-                    w_tolerance_time=args.w_tolerance_time,
+                    w_tolerance_ratio=args.w_tolerance_ratio,
                     w_post_var=args.w_post_var,
                     w_hold=args.w_hold,
                     invalid_penalty=args.invalid_penalty,

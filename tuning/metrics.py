@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 
 # Small guard helpers keep the feature calculations from being cluttered with
@@ -519,7 +523,7 @@ def score_controller(
     w_steady: float,
     w_iae: float,
     w_ise: float,
-    w_tolerance_time: float,
+    w_tolerance_ratio: float,
     w_post_var: float,
     w_hold: float,
     invalid_penalty: float,
@@ -528,6 +532,18 @@ def score_controller(
 ):
     """Combine control metrics into one scalar score (lower is better)."""
     hold_ratio = float(metrics.get("hold_time_in_tolerance_ratio", 0.0))
+    time_in_tol = float(metrics.get("time_in_tolerance_s", 0.0))
+    duration = float(metrics.get("trace_duration_s", 0.0))
+    good_ratio = 0.0
+    if duration > 1e-6:
+        good_ratio = time_in_tol / duration
+    good_ratio = max(0.0, min(1.0, good_ratio))
+    logger.debug(
+        "Tolerance ratio: %.3f (time=%.2fs / duration=%.2fs)",
+        good_ratio,
+        time_in_tol,
+        duration,
+    )
     # Discount average tracking error when the controller demonstrably holds the
     # target well in the tail.
     track_discount = 0.25 if hold_ratio >= 0.80 else (0.50 if hold_ratio >= 0.50 else 1.0)
@@ -547,7 +563,7 @@ def score_controller(
         + w_ise * float(metrics["ise"])
         + w_post_var * float(metrics["post_settle_variance"])
         + w_hold * float(metrics.get("hold_quality", 999.0))
-        - w_tolerance_time * float(metrics["time_in_tolerance_s"])
+        - w_tolerance_ratio * good_ratio
         + invalid_penalty * float(metrics["invalid_ratio"])
     )
     # Hard behavioural penalties sit outside the weighted sum because they
