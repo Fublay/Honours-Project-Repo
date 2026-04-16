@@ -157,6 +157,12 @@ def run_trial(
         display_kd = float(current_pid["pw_kd"])
     if monitor is not None:
         monitor.set_target(desired_output)
+        monitor.set_pid_values(
+            display_kp,
+            display_ki,
+            display_kd,
+            best_pid=best_pid,
+        )
         monitor.set_progress(
             _candidate_progress_message(
                 phase_name=phase_name,

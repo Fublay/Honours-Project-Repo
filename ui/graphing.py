@@ -62,7 +62,7 @@ class RuntimeMonitor:
         self.prev_warmup_result_var = tk.StringVar(value="Previous warmup result: none yet")
         self.readiness_var = tk.StringVar(value="Bootstrap readiness:\n- waiting for bootstrap data")
         self.power_var = tk.StringVar(value="Current power: --")
-        self.pid_var = tk.StringVar(value="PID: --")
+        self.pid_var = tk.StringVar(value="Controller PID under test: --")
 
         tk.Label(frame, text="Live Power Output", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
 
@@ -250,7 +250,6 @@ class RuntimeMonitor:
             return
 
         self._candidate_reason_base = str(reason)
-        self.pid_var.set(f"Testing PID: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}")
         self.progress_var.set(self._candidate_reason_base)
         self.process_events()
 
@@ -288,7 +287,7 @@ class RuntimeMonitor:
     ):
         if self.closed:
             return
-        message = f"Current PID values: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}"
+        message = f"Controller PID under test: Kp={kp:.4f}  Ki={ki:.4f}  Kd={kd:.4f}"
         if best_pid is not None:
             delta_kp = float(kp) - float(best_pid[0])
             delta_ki = float(ki) - float(best_pid[1])
