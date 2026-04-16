@@ -201,8 +201,7 @@ def format_readiness_status(
     *,
     bootstrap_status: dict | None,
     region_status: dict,
-    safe_count: int,
-    safe_target: int,
+    current_controller_pid: tuple[float, float, float] | None,
     good_count: int,
     good_target: int,
     warmup_trials_done: int | None = None,
@@ -230,6 +229,16 @@ def format_readiness_status(
             f"Kp={center_pid[0]:.4f}, Ki={center_pid[1]:.4f}, Kd={center_pid[2]:.4f}"
         )
 
+    if current_controller_pid is None:
+        current_pid_text = "Current controller PID: waiting for first applied trial"
+    else:
+        current_pid_text = (
+            "Current controller PID: "
+            f"Kp={current_controller_pid[0]:.4f}, "
+            f"Ki={current_controller_pid[1]:.4f}, "
+            f"Kd={current_controller_pid[2]:.4f}"
+        )
+
     local_safe = int(region_status.get("local_safe_count", 0))
     local_good = int(region_status.get("local_good_count", 0))
     local_unsafe = int(region_status.get("local_unsafe_count", 0))
@@ -240,7 +249,7 @@ def format_readiness_status(
     lines = [
         "Bootstrap readiness:",
         bootstrap_line,
-        f"{mark(safe_count >= safe_target)} Safe candidates: {safe_count}/{safe_target}",
+        current_pid_text,
         f"Good candidates observed: {good_count}/{good_target}",
         center_text,
         (
@@ -746,8 +755,7 @@ def main() -> None:
                     format_readiness_status(
                         bootstrap_status=bootstrap_status,
                         region_status=region_status,
-                        safe_count=0,
-                        safe_target=int(args.bayes_min_safe_trials),
+                        current_controller_pid=None,
                         good_count=0,
                         good_target=int(args.bayes_region_min_good_candidates),
                         warmup_trials_done=0,
@@ -1032,6 +1040,19 @@ def main() -> None:
                 else:
                     log(f"{display_phase_name} candidate -> kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
 
+                if monitor is not None:
+                    current_controller_pid = candidate_pid if apply_pid_update else last_applied
+                    monitor.set_readiness(
+                        format_readiness_status(
+                            bootstrap_status=bootstrap_status,
+                            region_status=region_status,
+                            current_controller_pid=current_controller_pid,
+                            good_count=len(good_trial_points),
+                            good_target=int(args.bayes_region_min_good_candidates),
+                            warmup_trials_done=bootstrap_trial_count,
+                        )
+                    )
+
                 _, _, _, aborted, current_pid, per_test_powers, per_test_times, per_test_meta, cancelled_candidate, cancel_reason = run_trial(
                     io,
                     kp,
@@ -1247,8 +1268,7 @@ def main() -> None:
                             format_readiness_status(
                                 bootstrap_status=bootstrap_status,
                                 region_status=region_status,
-                                safe_count=len(safe_trial_points),
-                                safe_target=int(args.bayes_min_safe_trials),
+                                current_controller_pid=last_applied,
                                 good_count=len(good_trial_points),
                                 good_target=int(args.bayes_region_min_good_candidates),
                                 warmup_trials_done=bootstrap_done,
@@ -1526,8 +1546,7 @@ def main() -> None:
                             format_readiness_status(
                                 bootstrap_status=bootstrap_status,
                                 region_status=region_status,
-                                safe_count=len(safe_trial_points),
-                                safe_target=int(args.bayes_min_safe_trials),
+                                current_controller_pid=last_applied,
                                 good_count=len(good_trial_points),
                                 good_target=int(args.bayes_region_min_good_candidates),
                                 warmup_trials_done=bootstrap_trial_count,
@@ -1616,8 +1635,7 @@ def main() -> None:
                             format_readiness_status(
                                 bootstrap_status=bootstrap_status,
                                 region_status=region_status,
-                                safe_count=len(safe_trial_points),
-                                safe_target=int(args.bayes_min_safe_trials),
+                                current_controller_pid=last_applied,
                                 good_count=len(good_trial_points),
                                 good_target=int(args.bayes_region_min_good_candidates),
                                 warmup_trials_done=bootstrap_trial_count,
