@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+import time
 
 import numpy as np
 
@@ -181,6 +182,8 @@ def run_trial(
 
     io.write_command_expect_ok_ack("", command_id_hex2=CMD.RUN, timeout=2.0)
     io.write_command_expect_ok_ack("1", command_id_hex2=CMD.SHUTTER_CONTROL, timeout=2.0)
+    log("Shutter opened; waiting 1.0s before sending the next command")
+    time.sleep(1.0)
 
     try:
         for rep in range(repeats):
