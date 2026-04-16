@@ -450,7 +450,7 @@ def main() -> None:
     ap.add_argument(
         "--startup-telemetry-timeout-s",
         type=float,
-        default=5.0,
+        default=10.0,
         help="Maximum seconds to wait after START for the first valid telemetry packet",
     )
     ap.add_argument("--settled-window-samples", type=int, default=5, help="Consecutive in-band samples to mark settled")
